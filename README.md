@@ -84,6 +84,9 @@ Drafts are private files under `~/.local/share/terminal-email/drafts` (respectin
 
 ## Development
 
+See the [developer guide](docs/development.md) for architecture diagrams,
+runtime and storage details, extension checklists, testing, and troubleshooting.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
