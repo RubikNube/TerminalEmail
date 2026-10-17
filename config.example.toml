@@ -1,0 +1,37 @@
+[account]
+email = "you@example.com"
+display_name = "Your Name"
+username = "you@example.com"
+# Set these if your server does not advertise SPECIAL-USE folders:
+# archive_folder = "Archive"
+# trash_folder = "Trash"
+# sent_folder = "Sent"
+
+[account.imap]
+host = "imap.example.com"
+port = 993
+tls = "implicit"
+
+[account.smtp]
+host = "smtp.example.com"
+port = 587
+tls = "starttls"
+
+[editor]
+# command = "vim" # Otherwise use $EDITOR, then vi. No shell expansion.
+
+[keybindings]
+timeout_ms = 750
+
+[keybindings.global]
+"j" = "cursor.down"
+"k" = "cursor.up"
+"gg" = "cursor.first"
+"G" = "cursor.last"
+# "Ctrl-j" = "cursor.down"
+# "x" = "unbound"
+
+[keybindings.message]
+"]" = "message.next"
+"[" = "message.previous"
+"S" = "attachment.save"
