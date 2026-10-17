@@ -82,10 +82,21 @@ worker thread. The worker then owns database and network operations. Its
 `MailWorker<B>` uses the private `MailBackend` trait, allowing tests to substitute
 a fake backend without involving the terminal.
 
-Requests execute sequentially, including local search. A long synchronization can
-delay later requests even though the terminal remains responsive. UI requests
-use `try_send`; a full or disconnected request channel produces a status error.
-This channel is an in-memory work queue, not a durable offline operation queue.
+One worker owns the cache and IMAP session. Background synchronization is resumable:
+folder listing, each unread-count request, mailbox selection, UID search, and each
+100-message header batch yield to queued interactive requests. Interactive work
+retains FIFO order, including mutations. An active network operation completes or
+times out before the next request runs; it is never cancelled to prioritize a read.
+The worker restores the selected mailbox and verifies UIDVALIDITY before resuming
+folder-specific sync work after an interruption. Pending refreshes for the same
+folder and body downloads for the same folder/UIDVALIDITY/UID are coalesced.
+
+UI requests use `try_send`; a full or disconnected request channel produces a
+status error or a message-specific body failure. This channel is an in-memory
+work queue, not a durable offline operation queue. Missing bodies show loading,
+failure, or offline notices. Ctrl-r in the reader retries a missing body; otherwise
+it refreshes the active folder. Body results and errors are associated with the
+message identity so navigation does not redirect them to another message.
 
 The input loop polls at 50 ms intervals. While online, it requests a refresh of
 the active folder every 60 seconds. There is no IMAP IDLE subscription. An error
@@ -136,6 +147,10 @@ sequenceDiagram
     end
     W-->>A: Body update
 ```
+
+Interactive requests can run between the network steps shown above. A successful
+move discards any paused sync snapshot for its source folder and schedules a new
+sync rather than blocking other requests until reconciliation finishes.
 
 Each sync fetches headers and flags for the current undeleted UID set; it is not
 a delta sync based on modification sequences. Downloaded bodies and attachments
@@ -244,8 +259,9 @@ uses the word "Delivered" in a Sent-copy warning; this means SMTP accepted the
 submission, not that a recipient's inbox has confirmed delivery. Sent-copy
 failure must not become a send failure or cause an automatic resend.
 
-The worker's outer request deadline is 120 seconds, the SMTP transport timeout
-is 45 seconds, and Sent-copy upload has a 30-second deadline. A lost connection
+Each background sync step has a 30-second deadline; failure stops that sync and
+drops the connection. Foreground requests have a 120-second deadline, the SMTP
+transport timeout is 45 seconds, and Sent-copy upload has a 30-second deadline. A lost connection
 can leave an operation's outcome uncertain. Preserve that distinction when
 adding retries or improving status reporting.
 
@@ -337,7 +353,7 @@ generator or diagram build step is required.
 | Keyring lookup or save fails | Check the Secret Service session; prompt on startup. |
 | Search misses a body | Open the message to download and index its body. |
 | Archive, Trash, or Sent unavailable | Set the appropriate account folder override. |
-| A request appears delayed | Check whether the sequential worker is still syncing. |
+| A message appears delayed | It waits for the current network step, then takes priority over remaining sync work. On failure, Ctrl-r in the reader retries its body. |
 
 For IMAP STARTTLS, use the provider's hostname and port with this mode:
 

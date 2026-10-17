@@ -11,7 +11,11 @@ use lettre::{
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
     transport::smtp::authentication::Credentials,
 };
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    time::Duration,
+};
 use tokio::{net::TcpStream, sync::mpsc};
 
 type Session = async_imap::Session<tokio_native_tls::TlsStream<TcpStream>>;
@@ -51,6 +55,10 @@ pub enum Update {
         messages: Vec<Message>,
     },
     Body(Box<Message>),
+    BodyError {
+        message: Box<Message>,
+        error: String,
+    },
     Status(String),
     Error(String),
     Sent {
@@ -67,38 +75,43 @@ pub struct Worker {
 pub fn start(config: Config, password: String, path: PathBuf) -> Result<Worker> {
     let cache = Cache::open(&path)?;
     let backend = ImapSmtp::new(config, password)?;
-    let (requests, mut receiver) = mpsc::channel(32);
+    let (requests, receiver) = mpsc::channel(32);
     let (sender, updates) = mpsc::unbounded_channel();
-    std::thread::Builder::new().name("mail-worker".into()).spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => runtime,
-            Err(error) => { let _ = sender.send(Update::Error(error.to_string())); return; }
-        };
-        runtime.block_on(async move {
-            let mut worker = MailWorker { cache, backend, sender };
-            if let Ok(folders) = worker.cache.folders() { let _ = worker.sender.send(Update::Folders(folders)); }
-            while let Some(request) = receiver.recv().await {
-                // Never retry mutations automatically: a timed-out server may have applied them.
-                match tokio::time::timeout(Duration::from_secs(120), worker.handle(request)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        worker.backend.session = None;
-                        let _ = worker.sender.send(Update::Error(safe_text(&format!("{error:#}"))));
-                    }
-                    Err(_) => {
-                        worker.backend.session = None;
-                        let _ = worker.sender.send(Update::Error("Request timed out. Cached mail remains available. A mutation or send may have reached the server; check before retrying.".into()));
-                    }
+    std::thread::Builder::new()
+        .name("mail-worker".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(Update::Error(error.to_string()));
+                    return;
                 }
-            }
-        });
-    })?;
+            };
+            runtime.block_on(async move {
+                let mut worker = MailWorker {
+                    cache,
+                    backend,
+                    sender,
+                    jobs: VecDeque::new(),
+                    selected: None,
+                };
+                if let Ok(folders) = worker.cache.folders() {
+                    worker.emit(Update::Folders(folders));
+                }
+                worker.run(receiver).await;
+            });
+        })?;
     Ok(Worker { requests, updates })
 }
 
 /// Protocol boundary used by the worker and deterministic fake-backend tests.
 trait MailBackend {
     async fn folders(&mut self) -> Result<Vec<Folder>>;
+    async fn unread(&mut self, folder: &str) -> Result<u32>;
+    fn disconnect(&mut self);
     async fn select(&mut self, folder: &str, expected: Option<u32>) -> Result<u32>;
     async fn uids(&mut self) -> Result<HashSet<u32>>;
     async fn fetch(
@@ -201,23 +214,32 @@ impl MailBackend for ImapSmtp {
             .into_iter()
             .find(|(attribute, _)| flags.contains(attribute))
             .map(|(_, role)| role.to_owned());
-            let unread = session
-                .status(name.name(), "(UNSEEN)")
-                .await
-                .map(|s| s.unseen.unwrap_or(0))
-                .unwrap_or(0);
             folders.push(Folder {
                 name: if name.name().eq_ignore_ascii_case("INBOX") {
                     "INBOX".into()
                 } else {
                     name.name().into()
                 },
-                unread,
+                unread: 0,
                 role,
             });
         }
         folders.sort_by_key(|f| (!f.name.eq_ignore_ascii_case("INBOX"), f.name.clone()));
         Ok(folders)
+    }
+
+    async fn unread(&mut self, folder: &str) -> Result<u32> {
+        Ok(self
+            .session()
+            .await?
+            .status(folder, "(UNSEEN)")
+            .await?
+            .unseen
+            .unwrap_or(0))
+    }
+
+    fn disconnect(&mut self) {
+        self.session = None;
     }
 
     async fn select(&mut self, folder: &str, expected: Option<u32>) -> Result<u32> {
@@ -388,6 +410,22 @@ struct MailWorker<B> {
     cache: Cache,
     backend: B,
     sender: mpsc::UnboundedSender<Update>,
+    jobs: VecDeque<SyncJob>,
+    selected: Option<(String, u32)>,
+}
+
+struct SyncJob {
+    folder: String,
+    phase: SyncPhase,
+    validity: Option<u32>,
+}
+
+enum SyncPhase {
+    Discover,
+    Counts { folders: Vec<Folder>, next: usize },
+    Select,
+    Uids,
+    Headers(VecDeque<Vec<u32>>),
 }
 
 impl<B: MailBackend> MailWorker<B> {
@@ -401,51 +439,202 @@ impl<B: MailBackend> MailWorker<B> {
         });
         Ok(())
     }
-    async fn sync(&mut self, folder: &str) -> Result<()> {
+    fn schedule(&mut self, folder: String, refresh: bool) -> Result<()> {
+        self.cached(&folder)?;
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.folder == folder) {
+            // A pending discovery already includes the requested synchronization.
+            if refresh && matches!(job.phase, SyncPhase::Select) {
+                job.phase = SyncPhase::Discover;
+            }
+            return Ok(());
+        }
         self.emit(Update::Status(format!(
             "Synchronizing {}…",
-            safe_text(folder)
+            safe_text(&folder)
         )));
-        let validity = self.backend.select(folder, None).await?;
-        self.cache.check_validity(folder, validity)?;
-        // Emit immediately after invalidation so stale UIDs cannot remain actionable.
-        self.cached(folder)?;
-        let remote = self.backend.uids().await?;
-        self.cache.reconcile(folder, &remote)?;
-        let mut uids: Vec<_> = remote.into_iter().collect();
-        uids.sort_unstable_by(|a, b| b.cmp(a));
-        for chunk in uids.chunks(100) {
-            let updates = self.backend.fetch(folder, validity, chunk, false).await?;
-            for mut message in updates {
-                if let Some(old) = self.cache.message(folder, message.uid)? {
-                    message.body = old.body;
-                    message.attachments = old.attachments;
-                }
-                self.cache.put(&message)?;
-            }
-            self.cached(folder)?;
-        }
-        self.cached(folder)?;
-        self.emit(Update::Status(
-            "Synchronized · / searches cached mail · ? help".into(),
-        ));
+        self.jobs.push_front(SyncJob {
+            folder,
+            phase: if refresh {
+                SyncPhase::Discover
+            } else {
+                SyncPhase::Select
+            },
+            validity: None,
+        });
         Ok(())
+    }
+
+    async fn run(&mut self, mut receiver: mpsc::Receiver<Request>) {
+        let mut pending = VecDeque::new();
+        loop {
+            // Drain first so interactive work overtakes background refreshes.
+            while let Ok(request) = receiver.try_recv() {
+                self.enqueue(request, &mut pending);
+            }
+            if let Some(request) = pending.pop_front() {
+                let body = match &request {
+                    Request::Body(m) => Some(m.clone()),
+                    _ => None,
+                };
+                // Foreground commands may change the selected mailbox.
+                self.selected = None;
+                let result =
+                    tokio::time::timeout(Duration::from_secs(120), self.handle(request)).await;
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(safe_text(&format!("{error:#}"))),
+                    Err(_) => Some(if body.is_some() {
+                        "Message download timed out.".into()
+                    } else {
+                        "Request timed out. Cached mail remains available. A mutation or send may have reached the server; check before retrying.".into()
+                    }),
+                };
+                // Requests arriving during an active download share its result, including failure.
+                while let Ok(request) = receiver.try_recv() {
+                    if let (Some(active), Request::Body(other)) = (&body, &request)
+                        && active.folder == other.folder
+                        && active.uid_validity == other.uid_validity
+                        && active.uid == other.uid
+                    {
+                        continue;
+                    }
+                    self.enqueue(request, &mut pending);
+                }
+                if let Some(error) = error {
+                    self.backend.disconnect();
+                    if let Some(message) = body {
+                        self.emit(Update::BodyError {
+                            message: Box::new(message),
+                            error,
+                        });
+                    } else {
+                        self.emit(Update::Error(error));
+                    }
+                }
+            } else if let Some(job) = self.jobs.pop_front() {
+                match tokio::time::timeout(Duration::from_secs(30), self.advance(job)).await {
+                    Ok(Ok(Some(job))) => self.jobs.push_front(job),
+                    Ok(Ok(None)) => {}
+                    result => {
+                        self.backend.disconnect();
+                        self.selected = None;
+                        let error = match result {
+                            Ok(Err(error)) => safe_text(&format!("{error:#}")),
+                            _ => "Synchronization step timed out. Cached mail remains available."
+                                .into(),
+                        };
+                        self.emit(Update::Error(error));
+                    }
+                }
+            } else {
+                match receiver.recv().await {
+                    Some(request) => self.enqueue(request, &mut pending),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    fn enqueue(&mut self, request: Request, pending: &mut VecDeque<Request>) {
+        match request {
+            Request::Refresh(folder) => {
+                if let Err(error) = self.schedule(folder, true) {
+                    self.emit(Update::Error(error.to_string()));
+                }
+            }
+            Request::Load(folder) => {
+                if let Err(error) = self.schedule(folder, false) {
+                    self.emit(Update::Error(error.to_string()));
+                }
+            }
+            Request::Body(ref message)
+                if pending.iter().any(|request| {
+                    matches!(request, Request::Body(other) if other.folder == message.folder
+                    && other.uid_validity == message.uid_validity && other.uid == message.uid)
+                }) => {}
+            request => pending.push_back(request),
+        }
+    }
+
+    async fn advance(&mut self, mut job: SyncJob) -> Result<Option<SyncJob>> {
+        // Restore selection in its own step after foreground work or another job.
+        if let Some(validity) = job.validity
+            && self.selected.as_ref() != Some(&(job.folder.clone(), validity))
+        {
+            self.backend.select(&job.folder, Some(validity)).await?;
+            self.selected = Some((job.folder.clone(), validity));
+            return Ok(Some(job));
+        }
+        job.phase = match job.phase {
+            SyncPhase::Discover => {
+                let folders = self.backend.folders().await?;
+                self.cache.set_folders(&folders)?;
+                self.emit(Update::Folders(folders.clone()));
+                SyncPhase::Counts { folders, next: 0 }
+            }
+            SyncPhase::Counts { mut folders, next } => {
+                if next < folders.len() {
+                    folders[next].unread = self.backend.unread(&folders[next].name).await?;
+                    self.cache.set_folders(&folders)?;
+                    self.emit(Update::Folders(folders.clone()));
+                    SyncPhase::Counts {
+                        folders,
+                        next: next + 1,
+                    }
+                } else {
+                    SyncPhase::Select
+                }
+            }
+            SyncPhase::Select => {
+                let validity = self.backend.select(&job.folder, None).await?;
+                self.cache.check_validity(&job.folder, validity)?;
+                self.cached(&job.folder)?;
+                job.validity = Some(validity);
+                self.selected = Some((job.folder.clone(), validity));
+                SyncPhase::Uids
+            }
+            SyncPhase::Uids => {
+                let remote = self.backend.uids().await?;
+                self.cache.reconcile(&job.folder, &remote)?;
+                self.cached(&job.folder)?;
+                let mut uids: Vec<_> = remote.into_iter().collect();
+                uids.sort_unstable_by(|a, b| b.cmp(a));
+                SyncPhase::Headers(uids.chunks(100).map(<[u32]>::to_vec).collect())
+            }
+            SyncPhase::Headers(mut chunks) => {
+                let Some(chunk) = chunks.pop_front() else {
+                    self.emit(Update::Status(
+                        "Synchronized · / searches cached mail · ? help".into(),
+                    ));
+                    return Ok(None);
+                };
+                let validity = job
+                    .validity
+                    .context("Missing synchronization mailbox identity")?;
+                let updates = self
+                    .backend
+                    .fetch(&job.folder, validity, &chunk, false)
+                    .await?;
+                for mut message in updates {
+                    if let Some(old) = self.cache.message(&job.folder, message.uid)?
+                        && old.uid_validity == validity
+                    {
+                        message.body = old.body;
+                        message.attachments = old.attachments;
+                    }
+                    self.cache.put(&message)?;
+                }
+                self.cached(&job.folder)?;
+                SyncPhase::Headers(chunks)
+            }
+        };
+        Ok(Some(job))
     }
 
     async fn handle(&mut self, request: Request) -> Result<()> {
         match request {
-            Request::Refresh(folder) => {
-                self.cached(&folder)?;
-                self.emit(Update::Status("Connecting to IMAP…".into()));
-                let folders = self.backend.folders().await?;
-                self.cache.set_folders(&folders)?;
-                self.emit(Update::Folders(folders));
-                self.sync(&folder).await?;
-            }
-            Request::Load(folder) => {
-                self.cached(&folder)?;
-                self.sync(&folder).await?;
-            }
+            Request::Refresh(folder) => self.schedule(folder, true)?,
+            Request::Load(folder) => self.schedule(folder, false)?,
             Request::Search { folder, query } => self.emit(Update::Search {
                 messages: self.cache.search(&folder, &query)?,
                 folder,
@@ -504,7 +693,9 @@ impl<B: MailBackend> MailWorker<B> {
                     .select(&message.folder, Some(message.uid_validity))
                     .await?;
                 self.backend.move_to(message.uid, &destination).await?;
-                self.sync(&message.folder).await?;
+                // Drop a paused UID snapshot which predates this mutation.
+                self.jobs.retain(|job| job.folder != message.folder);
+                self.schedule(message.folder, false)?;
             }
             Request::Send { draft, message } => {
                 self.emit(Update::Status("Sending message…".into()));

@@ -267,28 +267,80 @@ struct FakeMail {
     sent: usize,
     sent_copy_fails: bool,
     send_fails: bool,
+    selected: String,
+    validity: u32,
+    events: Option<mpsc::UnboundedSender<String>>,
+    gate: Option<(String, mpsc::Receiver<()>)>,
+}
+
+impl FakeMail {
+    async fn record(&mut self, event: String) {
+        if let Some(events) = &self.events {
+            let _ = events.send(event.clone());
+        }
+        if let Some((blocked, permits)) = &mut self.gate
+            && event == *blocked
+        {
+            permits.recv().await.expect("test gate closed");
+        }
+    }
 }
 impl MailBackend for FakeMail {
+    async fn unread(&mut self, folder: &str) -> Result<u32> {
+        self.record(format!("unread:{folder}")).await;
+        Ok(0)
+    }
+    fn disconnect(&mut self) {
+        self.selected.clear();
+        if let Some(events) = &self.events {
+            let _ = events.send("disconnect".into());
+        }
+    }
+
     async fn folders(&mut self) -> Result<Vec<Folder>> {
+        self.record("folders".into()).await;
         Ok(vec![Folder {
             name: "INBOX".into(),
             ..Default::default()
         }])
     }
-    async fn select(&mut self, _: &str, expected: Option<u32>) -> Result<u32> {
-        if expected.is_some_and(|v| v != 7) {
+    async fn select(&mut self, folder: &str, expected: Option<u32>) -> Result<u32> {
+        self.record(format!("select:{folder}")).await;
+        self.selected = folder.into();
+        if expected.is_some_and(|v| v != self.validity) {
             bail!("UIDVALIDITY changed");
         }
-        Ok(7)
+        Ok(self.validity)
     }
     async fn uids(&mut self) -> Result<HashSet<u32>> {
-        Ok(self.messages.iter().map(|m| m.uid).collect())
-    }
-    async fn fetch(&mut self, _: &str, _: u32, uids: &[u32], body: bool) -> Result<Vec<Message>> {
+        self.record(format!("uids:{}", self.selected)).await;
         Ok(self
             .messages
             .iter()
-            .filter(|m| uids.contains(&m.uid))
+            .filter(|m| m.folder == self.selected)
+            .map(|m| m.uid)
+            .collect())
+    }
+    async fn fetch(
+        &mut self,
+        folder: &str,
+        _: u32,
+        uids: &[u32],
+        body: bool,
+    ) -> Result<Vec<Message>> {
+        assert_eq!(
+            self.selected, folder,
+            "fetch used the wrong selected mailbox"
+        );
+        self.record(format!(
+            "{}:{folder}",
+            if body { "body" } else { "headers" }
+        ))
+        .await;
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| m.folder == folder && uids.contains(&m.uid))
             .cloned()
             .map(|mut m| {
                 if !body {
@@ -299,6 +351,7 @@ impl MailBackend for FakeMail {
             .collect())
     }
     async fn flag(&mut self, uid: u32, starred: bool, value: bool) -> Result<()> {
+        self.record(format!("flag:{uid}:{value}")).await;
         if let Some(m) = self.messages.iter_mut().find(|m| m.uid == uid) {
             if starred {
                 m.starred = value;
@@ -350,6 +403,10 @@ fn setup() -> (
         sent: 0,
         sent_copy_fails: false,
         send_fails: false,
+        selected: String::new(),
+        validity: 7,
+        events: None,
+        gate: None,
     };
     (
         temporary,
@@ -357,6 +414,8 @@ fn setup() -> (
             cache,
             backend,
             sender,
+            jobs: VecDeque::new(),
+            selected: None,
         },
         receiver,
     )
@@ -369,6 +428,7 @@ async fn sync_lazy_download_flags_search_and_move() {
         .handle(Request::Refresh("INBOX".into()))
         .await
         .unwrap();
+    finish_sync(&mut worker).await;
     let header = worker.cache.message("INBOX", 1).unwrap().unwrap();
     assert!(header.body.is_none());
     worker.handle(Request::Body(header.clone())).await.unwrap();
@@ -394,6 +454,7 @@ async fn sync_lazy_download_flags_search_and_move() {
         .handle(Request::Refresh("INBOX".into()))
         .await
         .unwrap();
+    finish_sync(&mut worker).await;
     let saved = worker.cache.message("INBOX", 1).unwrap().unwrap();
     assert!(saved.starred);
     assert!(saved.body.is_some());
@@ -415,6 +476,7 @@ async fn sync_lazy_download_flags_search_and_move() {
         })
         .await
         .unwrap();
+    finish_sync(&mut worker).await;
     assert!(worker.cache.messages("INBOX").unwrap().is_empty());
     let mut stale = header;
     stale.uid_validity = 6;
@@ -477,4 +539,248 @@ async fn accepted_smtp_and_failed_sent_copy_are_never_reported_as_send_failure()
     );
     assert!(path.exists());
     assert_eq!(worker.backend.sent, 1);
+}
+
+async fn finish_sync<B: MailBackend>(worker: &mut MailWorker<B>) {
+    while let Some(job) = worker.jobs.pop_front() {
+        if let Some(job) = worker.advance(job).await.unwrap() {
+            worker.jobs.push_front(job);
+        }
+    }
+}
+
+fn observed(
+    worker: &mut MailWorker<FakeMail>,
+    blocked: &str,
+) -> (mpsc::UnboundedReceiver<String>, mpsc::Sender<()>) {
+    let (events, observed) = mpsc::unbounded_channel();
+    let (permits, gate) = mpsc::channel(8);
+    worker.backend.events = Some(events);
+    worker.backend.gate = Some((blocked.into(), gate));
+    (observed, permits)
+}
+
+async fn until(events: &mut mpsc::UnboundedReceiver<String>, expected: &str) {
+    loop {
+        let event = events
+            .recv()
+            .await
+            .expect("worker stopped before expected operation");
+        if event == expected {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn opening_during_header_batch_overtakes_remaining_sync_and_preserves_body() {
+    let (_temp, mut worker, mut updates) = setup();
+    let template = worker.backend.messages[0].clone();
+    worker.backend.messages = (1..=201)
+        .map(|uid| Message {
+            uid,
+            ..template.clone()
+        })
+        .collect();
+    let (mut events, permits) = observed(&mut worker, "headers:INBOX");
+    let (requests, receiver) = mpsc::channel(32);
+    requests
+        .send(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move {
+        worker.run(receiver).await;
+        worker
+    });
+    until(&mut events, "headers:INBOX").await;
+    requests
+        .send(Request::Body(template.clone()))
+        .await
+        .unwrap();
+    requests.send(Request::Body(template)).await.unwrap();
+    requests
+        .send(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    permits.send(()).await.unwrap();
+    // After the current batch, body selection/fetch comes before the next headers.
+    assert_eq!(events.recv().await.as_deref(), Some("select:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("body:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("select:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("headers:INBOX"));
+    permits.send(()).await.unwrap();
+    until(&mut events, "headers:INBOX").await;
+    permits.send(()).await.unwrap();
+    drop(requests);
+    let worker = task.await.unwrap();
+    assert!(
+        worker
+            .cache
+            .message("INBOX", 1)
+            .unwrap()
+            .unwrap()
+            .body
+            .is_some()
+    );
+    let bodies = std::iter::from_fn(|| updates.try_recv().ok())
+        .filter(|u| matches!(u, Update::Body(_)))
+        .count();
+    assert_eq!(bodies, 1);
+    assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|e| e == "folders"));
+}
+
+#[tokio::test]
+async fn opening_during_discovery_overtakes_unread_counts() {
+    let (_temp, mut worker, _updates) = setup();
+    let message = worker.backend.messages[0].clone();
+    let (mut events, permits) = observed(&mut worker, "folders");
+    let (requests, receiver) = mpsc::channel(32);
+    requests
+        .send(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move {
+        worker.run(receiver).await;
+    });
+    until(&mut events, "folders").await;
+    requests.send(Request::Body(message)).await.unwrap();
+    permits.send(()).await.unwrap();
+    assert_eq!(events.recv().await.as_deref(), Some("select:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("body:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("unread:INBOX"));
+    drop(requests);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn sync_restores_mailbox_and_rejects_changed_identity() {
+    let (_temp, mut worker, _updates) = setup();
+    worker
+        .handle(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    // Pause just before fetching headers.
+    while !matches!(worker.jobs.front().unwrap().phase, SyncPhase::Headers(_)) {
+        let job = worker.jobs.pop_front().unwrap();
+        let job = worker.advance(job).await.unwrap().unwrap();
+        worker.jobs.push_front(job);
+    }
+    let mut other = worker.backend.messages[0].clone();
+    other.folder = "Other".into();
+    worker.backend.messages.push(other.clone());
+    worker.selected = None;
+    worker.handle(Request::Body(other)).await.unwrap();
+    assert_eq!(worker.backend.selected, "Other");
+    let job = worker.jobs.pop_front().unwrap();
+    let job = worker.advance(job).await.unwrap().unwrap();
+    assert_eq!(worker.backend.selected, "INBOX");
+    worker.selected = None;
+    worker.backend.validity = 8;
+    assert!(worker.advance(job).await.is_err());
+    assert!(worker.cache.messages("INBOX").unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_timeout_disconnects_and_foreground_download_still_runs() {
+    let (_temp, mut worker, mut updates) = setup();
+    let message = worker.backend.messages[0].clone();
+    let (mut events, _permits) = observed(&mut worker, "folders");
+    let (requests, receiver) = mpsc::channel(32);
+    requests
+        .send(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move {
+        worker.run(receiver).await;
+        worker
+    });
+    until(&mut events, "folders").await;
+    requests.send(Request::Body(message)).await.unwrap();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_eq!(events.recv().await.as_deref(), Some("disconnect"));
+    until(&mut events, "body:INBOX").await;
+    drop(requests);
+    let worker = task.await.unwrap();
+    assert!(worker.jobs.is_empty());
+    assert!(
+        std::iter::from_fn(|| updates.try_recv().ok())
+            .any(|u| matches!(u, Update::Error(e) if e.contains("timed out")))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn body_timeout_reports_identity_and_coalesces_in_flight_duplicates() {
+    let (_temp, mut worker, mut updates) = setup();
+    let message = worker.backend.messages[0].clone();
+    let (mut events, _permits) = observed(&mut worker, "body:INBOX");
+    let (requests, receiver) = mpsc::channel(32);
+    requests.send(Request::Body(message.clone())).await.unwrap();
+    let task = tokio::spawn(async move {
+        worker.run(receiver).await;
+    });
+    until(&mut events, "body:INBOX").await;
+    requests.send(Request::Body(message.clone())).await.unwrap();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    until(&mut events, "disconnect").await;
+    drop(requests);
+    task.await.unwrap();
+    let failures: Vec<_> = std::iter::from_fn(|| updates.try_recv().ok())
+        .filter_map(|u| {
+            if let Update::BodyError { message, error } = u {
+                Some((message, error))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0.uid, message.uid);
+    assert_eq!(failures[0].0.uid_validity, message.uid_validity);
+    assert!(failures[0].1.contains("timed out"));
+}
+
+#[tokio::test]
+async fn foreground_mutations_keep_fifo_order_and_body_failure_is_not_retried() {
+    let (_temp, mut worker, mut updates) = setup();
+    let message = worker.backend.messages[0].clone();
+    let (events, mut observed) = mpsc::unbounded_channel();
+    worker.backend.events = Some(events);
+    let (requests, receiver) = mpsc::channel(32);
+    for value in [true, false] {
+        requests
+            .send(Request::Flag {
+                message: message.clone(),
+                starred: true,
+                value,
+            })
+            .await
+            .unwrap();
+    }
+    let mut absent = message;
+    absent.uid = 99;
+    requests.send(Request::Body(absent.clone())).await.unwrap();
+    requests.send(Request::Body(absent)).await.unwrap();
+    drop(requests);
+    worker.run(receiver).await;
+    let calls: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
+    let flags: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with("flag:"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(flags, ["flag:1:true", "flag:1:false"]);
+    assert_eq!(calls.iter().filter(|call| *call == "body:INBOX").count(), 1);
+    assert!(!worker.backend.messages[0].starred);
+    let errors: Vec<_> = std::iter::from_fn(|| updates.try_recv().ok())
+        .filter_map(|u| {
+            if let Update::BodyError { message, error } = u {
+                Some((message, error))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0.uid, 99);
+    assert!(errors[0].1.contains("no longer exists"));
 }

@@ -242,7 +242,15 @@ fn reader(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(message) = app.selected() else {
         return;
     };
-    let mut text = format!("{}\nFrom: {}\nTo: {}\nDate: {}\n\n{}", message.subject, message.from, message.to, message.date, message.body.as_deref().unwrap_or("Downloading message… Cached headers remain available.\nCtrl-r to retry if the connection failed."));
+    let notice = app.body_notice(message);
+    let mut text = format!(
+        "{}\nFrom: {}\nTo: {}\nDate: {}\n\n{}",
+        message.subject,
+        message.from,
+        message.to,
+        message.date,
+        message.body.as_deref().unwrap_or(&notice)
+    );
     if !message.attachments.is_empty() {
         text.push_str("\n\nAttachments (S to save):\n");
         for (i, attachment) in message.attachments.iter().enumerate() {

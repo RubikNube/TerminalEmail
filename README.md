@@ -47,7 +47,7 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `m` / `s` | Toggle read / starred on the selected message |
 | `a` / `d` | Archive / move selected message to Trash |
 | `S` | Save a downloaded attachment |
-| `Ctrl-r` | Refresh |
+| `Ctrl-r` | Retry a missing message body, otherwise refresh |
 | `?` | Show configured bindings |
 
 Contexts are `global`, `folders`, `threads`, `message`, and `prompt`. Context mappings override equivalent global mappings. Add or replace keys with command names displayed in `?` help:
@@ -69,7 +69,7 @@ Plain sequences such as `gg` are character sequences. For named or modified keys
 
 ## Mail behavior
 
-- Folder headers and flags synchronize when opened and every 60 seconds. Bodies and attachments download on demand; previously downloaded content is readable offline.
+- Folder headers and flags synchronize when opened and every 60 seconds. Bodies and attachments download on demand; previously downloaded content is readable offline. Opening messages takes priority between synchronization steps. If a body download fails, Ctrl-r in the message view retries it.
 - Conversations are grouped using Message-ID and References/In-Reply-To. Messages without usable identifiers remain separate.
 - Search uses SQLite FTS5 over cached sender, recipients, subject, and downloaded body text in the active folder. Words are combined with AND. Search can miss bodies which have never been downloaded. Back clears the search.
 - Plain text is preferred. HTML-only email is converted to text; remote images are never loaded, and terminal control characters are removed.

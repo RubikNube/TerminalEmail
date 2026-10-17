@@ -8,7 +8,7 @@ use crate::{
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -38,6 +38,17 @@ pub enum Prompt {
     },
 }
 
+type MessageKey = (String, u32, u32);
+
+fn message_key(message: &Message) -> MessageKey {
+    (message.folder.clone(), message.uid_validity, message.uid)
+}
+
+enum BodyState {
+    Loading,
+    Failed(String),
+}
+
 pub struct App {
     pub config: Config,
     pub keys: KeyMap,
@@ -61,6 +72,7 @@ pub struct App {
     pub offline: bool,
     pub quit: bool,
     pub page_height: usize,
+    body_states: HashMap<MessageKey, BodyState>,
 }
 
 impl App {
@@ -86,6 +98,7 @@ impl App {
             search_ids: None,
             demo,
             offline,
+            body_states: HashMap::new(),
             quit: false,
             page_height: 20,
         })
@@ -189,13 +202,24 @@ impl App {
                     false,
                 );
             }
-            Update::Body(message) if message.folder == self.active_folder => {
-                if let Some(old) = self
-                    .messages
-                    .iter_mut()
-                    .find(|m| m.uid == message.uid && m.uid_validity == message.uid_validity)
+            Update::Body(message) => {
+                if message.body.is_some() {
+                    self.body_states.remove(&message_key(&message));
+                }
+                if message.folder == self.active_folder
+                    && let Some(old) = self
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.uid == message.uid && m.uid_validity == message.uid_validity)
                 {
                     *old = *message;
+                }
+            }
+            Update::BodyError { message, error } => {
+                let key = message_key(&message);
+                // A late failure must not replace a successfully loaded body.
+                if matches!(self.body_states.get(&key), Some(BodyState::Loading)) {
+                    self.body_states.insert(key, BodyState::Failed(error));
                 }
             }
             Update::Status(message) => self.status(message, false),
@@ -210,6 +234,36 @@ impl App {
         }
     }
 
+    fn load_body(&mut self, worker: Option<&Worker>, message: &Message) {
+        if self.offline
+            || matches!(
+                self.body_states.get(&message_key(message)),
+                Some(BodyState::Loading)
+            )
+        {
+            return;
+        }
+        let state = match worker {
+            Some(worker) => match worker.requests.try_send(Request::Body(message.clone())) {
+                Ok(()) => BodyState::Loading,
+                Err(_) => BodyState::Failed("Mail worker is busy or unavailable.".into()),
+            },
+            None => BodyState::Failed("Mail worker is unavailable.".into()),
+        };
+        self.body_states.insert(message_key(message), state);
+    }
+
+    pub fn body_notice(&self, message: &Message) -> String {
+        if self.offline {
+            return "This message has not been downloaded. Reconnect to read its body. Cached headers remain available.".into();
+        }
+        match self.body_states.get(&message_key(message)) {
+            Some(BodyState::Loading) => "Loading message… Waiting for the current mail operation or downloading its body. Cached headers remain available.".into(),
+            Some(BodyState::Failed(error)) => format!("Could not load message: {error}\nCtrl-r to retry."),
+            None => "Message body is not downloaded. Ctrl-r to load it.".into(),
+        }
+    }
+
     fn open_message(&mut self, worker: Option<&Worker>) {
         self.view = View::Message;
         self.scroll = 0;
@@ -217,7 +271,7 @@ impl App {
             && !self.demo
         {
             if message.body.is_none() {
-                self.request(worker, Request::Body(message.clone()));
+                self.load_body(worker, &message);
             }
             if !message.seen && !self.offline {
                 self.request(
@@ -346,7 +400,13 @@ impl App {
             }
             "refresh" => {
                 if !self.demo {
-                    self.request(worker, Request::Refresh(self.active_folder.clone()));
+                    if self.view == View::Message
+                        && let Some(message) = self.selected().filter(|m| m.body.is_none()).cloned()
+                    {
+                        self.load_body(worker, &message);
+                    } else {
+                        self.request(worker, Request::Refresh(self.active_folder.clone()));
+                    }
                 }
             }
             "message.next" | "message.previous" => {
@@ -777,6 +837,7 @@ use anyhow::Context;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
     #[test]
     fn prompt_and_help_respect_remapped_keys() {
         let mut app = demo_app().unwrap();
@@ -807,6 +868,119 @@ mod tests {
         app.command("back", None);
         assert!(!app.help);
     }
+    fn reader_with_worker() -> (App, Worker, mpsc::Receiver<Request>) {
+        let mut app = demo_app().unwrap();
+        app.demo = false;
+        app.offline = false;
+        app.view = View::Message;
+        let index = app.groups[app.thread_cursor][app.message_cursor];
+        app.messages[index].body = None;
+        app.messages[index].seen = true;
+        let (requests, receiver) = mpsc::channel(1);
+        let (_sender, updates) = mpsc::unbounded_channel();
+        (app, Worker { requests, updates }, receiver)
+    }
+
+    #[test]
+    fn body_failure_and_refresh_retry_are_message_specific() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        let message = app.selected().unwrap().clone();
+        app.open_message(Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        assert!(app.body_notice(&message).contains("Loading message"));
+        app.command("refresh", Some(&worker));
+        assert!(
+            requests.try_recv().is_err(),
+            "loading requests should be deduplicated"
+        );
+        app.update(
+            Update::BodyError {
+                message: Box::new(message.clone()),
+                error: "Connection lost".into(),
+            },
+            Some(&worker),
+        );
+        assert!(app.body_notice(&message).contains("Connection lost"));
+        assert!(app.body_notice(&message).contains("Ctrl-r to retry"));
+        app.command("refresh", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        let mut loaded = message.clone();
+        loaded.body = Some("Downloaded".into());
+        app.update(Update::Body(Box::new(loaded)), Some(&worker));
+        assert_eq!(app.selected().unwrap().body.as_deref(), Some("Downloaded"));
+        assert!(!app.body_states.contains_key(&message_key(&message)));
+        app.command("refresh", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Refresh(_))));
+        // A late failure cannot undo a successful download.
+        app.update(
+            Update::BodyError {
+                message: Box::new(message.clone()),
+                error: "Old failure".into(),
+            },
+            Some(&worker),
+        );
+        assert!(!app.body_states.contains_key(&message_key(&message)));
+    }
+
+    #[test]
+    fn offline_body_notice_does_not_offer_retry_or_queue_download() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        app.offline = true;
+        app.open_message(Some(&worker));
+        app.command("refresh", Some(&worker));
+        assert!(requests.try_recv().is_err());
+        let notice = app.body_notice(app.selected().unwrap());
+        assert!(notice.contains("Reconnect"));
+        assert!(!notice.contains("Ctrl-r"));
+        assert!(!notice.contains("Loading"));
+    }
+
+    #[test]
+    fn rejected_body_request_can_be_retried_and_late_updates_do_not_affect_selection() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        let original = app.selected().unwrap().clone();
+        worker
+            .requests
+            .try_send(Request::Refresh("INBOX".into()))
+            .unwrap();
+        app.open_message(Some(&worker));
+        assert!(app.body_notice(&original).contains("busy or unavailable"));
+        requests.try_recv().unwrap();
+        app.command("refresh", Some(&worker));
+        requests.try_recv().unwrap();
+        let mut stale = original.clone();
+        stale.uid_validity += 1;
+        app.update(
+            Update::BodyError {
+                message: Box::new(stale),
+                error: "Stale identity".into(),
+            },
+            Some(&worker),
+        );
+        assert!(app.body_notice(&original).contains("Loading"));
+        app.command("back", Some(&worker));
+        app.command("search.next", Some(&worker));
+        let selected = message_key(app.selected().unwrap());
+        app.update(
+            Update::BodyError {
+                message: Box::new(original.clone()),
+                error: "Earlier download failed".into(),
+            },
+            Some(&worker),
+        );
+        assert_eq!(message_key(app.selected().unwrap()), selected);
+        assert!(
+            !app.body_notice(app.selected().unwrap())
+                .contains("Earlier download failed")
+        );
+        // Completion in another folder also clears the original pending state.
+        let mut late = original.clone();
+        late.body = Some("Late completion".into());
+        app.active_folder = "Other".into();
+        app.update(Update::Body(Box::new(late)), Some(&worker));
+        assert!(!app.body_states.contains_key(&message_key(&original)));
+    }
+
     #[test]
     fn demo_navigation_threading_search_and_flags() {
         let mut app = demo_app().unwrap();
