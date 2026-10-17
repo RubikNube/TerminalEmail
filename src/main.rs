@@ -3,6 +3,7 @@ mod browser;
 mod cache;
 mod compose;
 mod config;
+mod grouping;
 mod keys;
 mod mail;
 mod model;
@@ -117,6 +118,7 @@ fn init(path: &std::path::Path) -> Result<()> {
             sent_folder: None,
         },
         editor: Editor::default(),
+        display: config::Display::default(),
         keybindings: KeyConfig::default(),
     };
     config.validate()?;

@@ -13,7 +13,23 @@ pub struct Config {
     #[serde(default)]
     pub editor: Editor,
     #[serde(default)]
+    pub display: Display,
+    #[serde(default)]
     pub keybindings: KeyConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Display {
+    pub time_grouping: bool,
+}
+
+impl Default for Display {
+    fn default() -> Self {
+        Self {
+            time_grouping: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +167,36 @@ pub fn private_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn time_grouping_defaults_and_toml_validation() {
+        let text = include_str!("../config.example.toml");
+        let defaulted: Config = toml::from_str(&text.replace("time_grouping = true", "")).unwrap();
+        assert!(defaulted.display.time_grouping);
+        let legacy: Config = toml::from_str(
+            &text
+                .replace("[display]", "")
+                .replace("time_grouping = true", ""),
+        )
+        .unwrap();
+        assert!(legacy.display.time_grouping);
+        let disabled: Config =
+            toml::from_str(&text.replace("time_grouping = true", "time_grouping = false")).unwrap();
+        assert!(!disabled.display.time_grouping);
+        disabled.validate().unwrap();
+        assert!(
+            toml::from_str::<Config>(
+                &text.replace("time_grouping = true", "time_grouping = \"true\"")
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<Config>(
+                &text.replace("time_grouping = true", "time_grouping = true\ninvalid = 1")
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn example_validates_and_rejects_plaintext() {
         let text = include_str!("../config.example.toml");

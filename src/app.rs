@@ -2,6 +2,7 @@ use crate::{
     browser::Browser,
     compose::{self, ComposeKind, Draft},
     config::Config,
+    grouping::{Period, Row, local_period},
     keys::KeyMap,
     mail::{self, Request, Update, Worker},
     model::{Attachment, Folder, Message, threads},
@@ -59,6 +60,11 @@ pub struct App {
     pub messages: Vec<Message>,
     pub groups: Vec<Vec<usize>>,
     pub thread_cursor: usize,
+    pub list_cursor: usize,
+    pub rows: Vec<Row>,
+    pub time_grouping: bool,
+    pub collapsed: HashSet<Period>,
+    grouping_date: chrono::NaiveDate,
     pub message_cursor: usize,
     pub scroll: u16,
     pub view: View,
@@ -82,6 +88,7 @@ impl App {
     pub fn new(config: Config, demo: bool, offline: bool) -> Result<Self> {
         Ok(Self {
             keys: KeyMap::new(&config.keybindings.contexts, config.keybindings.timeout_ms)?,
+            time_grouping: config.display.time_grouping,
             config,
             folders: vec![],
             folder_cursor: 0,
@@ -89,6 +96,10 @@ impl App {
             messages: vec![],
             groups: vec![],
             thread_cursor: 0,
+            list_cursor: 0,
+            rows: vec![],
+            collapsed: HashSet::new(),
+            grouping_date: chrono::Local::now().date_naive(),
             message_cursor: 0,
             scroll: 0,
             view: View::Folders,
@@ -122,6 +133,11 @@ impl App {
     }
 
     pub fn selected(&self) -> Option<&Message> {
+        if self.view == View::Threads
+            && matches!(self.rows.get(self.list_cursor), Some(Row::Heading(..)))
+        {
+            return None;
+        }
         let group = self.groups.get(self.thread_cursor)?;
         let index = if self.view == View::Message {
             self.message_cursor
@@ -132,21 +148,33 @@ impl App {
     }
 
     pub fn set_messages(&mut self, messages: Vec<Message>) {
-        let selected = self.selected().map(|m| m.uid);
+        let selected = self.selected().map(message_key);
+        let heading = if self.view == View::Threads {
+            match self.rows.get(self.list_cursor) {
+                Some(Row::Heading(period, _)) => Some(*period),
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.messages = messages;
         self.rebuild();
-        if let Some(uid) = selected {
+        if let Some(key) = selected {
             if let Some((group, offset)) = self.groups.iter().enumerate().find_map(|(g, group)| {
                 group
                     .iter()
-                    .position(|&i| self.messages[i].uid == uid)
+                    .position(|&i| message_key(&self.messages[i]) == key)
                     .map(|o| (g, o))
             }) {
                 self.thread_cursor = group;
                 self.message_cursor = offset;
+                self.reveal_thread();
             } else if self.view == View::Message {
                 self.view = View::Threads;
             }
+        }
+        if heading.is_some() {
+            self.rebuild_rows(heading);
         }
     }
 
@@ -162,6 +190,76 @@ impl App {
                 .get(self.thread_cursor)
                 .map_or(0, |g| g.len().saturating_sub(1)),
         );
+        if self.view == View::Message {
+            self.collapsed.remove(&self.period(self.thread_cursor));
+        }
+        self.rebuild_rows(None);
+    }
+
+    fn period(&self, group: usize) -> Period {
+        self.groups
+            .get(group)
+            .and_then(|g| g.last())
+            .and_then(|&i| self.messages.get(i))
+            .map_or(Period::Unknown, |m| {
+                local_period(m.timestamp, self.grouping_date)
+            })
+    }
+
+    fn rebuild_rows(&mut self, heading: Option<Period>) {
+        self.rows.clear();
+        if self.time_grouping {
+            for period in Period::ALL {
+                let groups: Vec<_> = (0..self.groups.len())
+                    .filter(|&g| self.period(g) == period)
+                    .collect();
+                if groups.is_empty() {
+                    continue;
+                }
+                self.rows.push(Row::Heading(period, groups.len()));
+                if !self.collapsed.contains(&period) {
+                    self.rows.extend(groups.into_iter().map(Row::Conversation));
+                }
+            }
+        } else {
+            self.rows
+                .extend((0..self.groups.len()).map(Row::Conversation));
+        }
+        let target = self.rows.iter().position(|row| match row {
+            Row::Heading(period, _) => heading == Some(*period),
+            Row::Conversation(group) => heading.is_none() && *group == self.thread_cursor,
+        });
+        self.list_cursor =
+            target.unwrap_or_else(|| self.list_cursor.min(self.rows.len().saturating_sub(1)));
+        self.sync_list_selection();
+    }
+
+    fn sync_list_selection(&mut self) {
+        if let Some(Row::Conversation(group)) = self.rows.get(self.list_cursor) {
+            self.thread_cursor = *group;
+        }
+    }
+
+    fn reveal_thread(&mut self) {
+        self.collapsed.remove(&self.period(self.thread_cursor));
+        self.rebuild_rows(None);
+    }
+
+    pub fn check_grouping_date(&mut self, date: chrono::NaiveDate) -> bool {
+        if self.grouping_date == date {
+            return false;
+        }
+        let heading = match self.rows.get(self.list_cursor) {
+            Some(Row::Heading(period, _)) => Some(*period),
+            _ => None,
+        };
+        self.grouping_date = date;
+        if heading.is_none() {
+            self.reveal_thread();
+        } else {
+            self.rebuild_rows(heading);
+        }
+        true
     }
 
     pub fn status(&mut self, message: impl Into<String>, error: bool) {
@@ -362,6 +460,18 @@ impl App {
             return None;
         }
         match command {
+            "threads.toggle_time_grouping" if self.view == View::Threads => {
+                self.time_grouping = !self.time_grouping;
+                self.reveal_thread();
+                self.status(
+                    if self.time_grouping {
+                        "Time grouping enabled"
+                    } else {
+                        "Time grouping disabled"
+                    },
+                    false,
+                );
+            }
             "quit" => self.quit = true,
             "help" => {
                 self.help = !self.help;
@@ -377,7 +487,7 @@ impl App {
                 };
                 let bound = match self.view {
                     View::Folders => self.folders.len().saturating_sub(1),
-                    View::Threads => self.groups.len().saturating_sub(1),
+                    View::Threads => self.rows.len().saturating_sub(1),
                     View::Message => self
                         .selected()
                         .and_then(|m| m.body.as_ref())
@@ -385,7 +495,7 @@ impl App {
                 };
                 let cursor = match self.view {
                     View::Folders => &mut self.folder_cursor,
-                    View::Threads => &mut self.thread_cursor,
+                    View::Threads => &mut self.list_cursor,
                     View::Message => {
                         self.scroll = match command {
                             "cursor.first" => 0,
@@ -404,6 +514,9 @@ impl App {
                     _ if down => cursor.saturating_add(amount).min(bound),
                     _ => cursor.saturating_sub(amount),
                 };
+                if self.view == View::Threads {
+                    self.sync_list_selection();
+                }
             }
             "open" => match self.view {
                 View::Folders => {
@@ -412,6 +525,9 @@ impl App {
                         if self.active_folder != name {
                             self.messages.clear();
                             self.groups.clear();
+                            self.rows.clear();
+                            self.list_cursor = 0;
+                            self.collapsed.clear();
                             self.search.clear();
                             self.search_ids = None;
                             self.thread_cursor = 0;
@@ -424,6 +540,17 @@ impl App {
                         }
                     }
                 }
+                View::Threads
+                    if matches!(self.rows.get(self.list_cursor), Some(Row::Heading(..))) =>
+                {
+                    if let Some(Row::Heading(period, _)) = self.rows.get(self.list_cursor).copied()
+                    {
+                        if !self.collapsed.remove(&period) {
+                            self.collapsed.insert(period);
+                        }
+                        self.rebuild_rows(Some(period));
+                    }
+                }
                 View::Threads if !self.groups.is_empty() => {
                     self.message_cursor = self.groups[self.thread_cursor].len().saturating_sub(1);
                     self.open_message(worker);
@@ -431,7 +558,10 @@ impl App {
                 _ => {}
             },
             "back" => match self.view {
-                View::Message => self.view = View::Threads,
+                View::Message => {
+                    self.view = View::Threads;
+                    self.reveal_thread();
+                }
                 View::Threads if !self.search.is_empty() => {
                     self.search.clear();
                     self.search_ids = None;
@@ -445,17 +575,40 @@ impl App {
                 self.keys.reset();
             }
             "search.next" | "search.previous" => {
-                if !self.groups.is_empty() {
+                if self.view == View::Threads {
+                    let candidates: Vec<_> = self
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, row)| matches!(row, Row::Conversation(_)).then_some(i))
+                        .collect();
+                    let next = if command == "search.next" {
+                        candidates
+                            .iter()
+                            .copied()
+                            .find(|&i| i > self.list_cursor)
+                            .or_else(|| candidates.first().copied())
+                    } else {
+                        candidates
+                            .iter()
+                            .copied()
+                            .rev()
+                            .find(|&i| i < self.list_cursor)
+                            .or_else(|| candidates.last().copied())
+                    };
+                    if let Some(next) = next {
+                        self.list_cursor = next;
+                        self.sync_list_selection();
+                    }
+                } else if self.view == View::Message && !self.groups.is_empty() {
                     self.thread_cursor = if command == "search.next" {
                         (self.thread_cursor + 1) % self.groups.len()
                     } else {
                         (self.thread_cursor + self.groups.len() - 1) % self.groups.len()
                     };
-                    if self.view == View::Message {
-                        self.message_cursor =
-                            self.groups[self.thread_cursor].len().saturating_sub(1);
-                        self.open_message(worker);
-                    }
+                    self.reveal_thread();
+                    self.message_cursor = self.groups[self.thread_cursor].len().saturating_sub(1);
+                    self.open_message(worker);
                 }
             }
             "refresh" => {
@@ -559,7 +712,9 @@ impl App {
 
     fn search(&mut self, query: String, worker: Option<&Worker>) {
         self.search = query.clone();
+        self.collapsed.clear();
         self.thread_cursor = 0;
+        self.list_cursor = 0;
         self.view = View::Threads;
         if query.is_empty() {
             self.search_ids = None;
@@ -763,18 +918,32 @@ pub fn demo_app() -> Result<App> {
         unread: 2,
         role: None,
     }];
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let timestamp = today
+        .and_hms_opt(0, 0, 0)
+        .and_then(|date| date.and_local_timezone(chrono::Local).earliest())
+        .map_or(now.timestamp(), |date| date.timestamp());
     let first = Message {
         uid: 1, folder: "INBOX".into(), uid_validity: 1, message_id: "welcome@terminal-email".into(),
         from: "TerminalEmail <hello@example.org>".into(), to: "you@example.com".into(),
-        subject: "Welcome to your terminal inbox".into(), date: "2026-10-17 10:00".into(), timestamp: 1,
+        subject: "Welcome to your terminal inbox".into(), date: chrono::DateTime::from_timestamp(timestamp, 0).unwrap().with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(), timestamp,
         body: Some("Your inbox, at the speed of a keystroke.\n\nUse j/k to move, Enter or l to open, h or q to go back.\n\ngg and G jump to the first and last item. Ctrl-d/u scroll half a page.\n\nPress ? for every configured binding. Remap keys in config.toml.\n\nThis is an offline demo. No mail server is contacted.\n\nYou can save the attached example with S.\n\nHappy reading!".into()),
         html_body: Some("<html><body><h1>Welcome to TerminalEmail</h1><p>Your inbox, at the speed of a keystroke.</p><p>Press <b>b</b> in the message view to open HTML in your browser.</p></body></html>".into()),
         html_loaded: true,
         attachments: vec![Attachment { name: "welcome.txt".into(), content_type: "text/plain".into(), data: b"Welcome to TerminalEmail!\n".to_vec() }], ..Default::default()
     };
-    let reply = Message { uid: 2, message_id: "reply@terminal-email".into(), references: vec![first.message_id.clone()], subject: "Re: Welcome to your terminal inbox".into(), timestamp: 2, body: Some("Conversations stay together.\n\nUse [ and ] in the message view to move between messages in this thread.\n\nPress / to search the locally cached sender, recipients, subject, and message text.".into()), attachments: vec![], html_body: None, ..first.clone() };
-    let other = Message { uid: 3, message_id: "keys@terminal-email".into(), subject: "Make it yours: configurable Vim bindings".into(), timestamp: 3, body: Some("Keybindings are commands grouped by context: global, folders, threads, message, and prompt.\n\nExample TOML:\n\n[keybindings.global]\n\"j\" = \"cursor.down\"\n\"gg\" = \"cursor.first\"\n\nThe default sequence timeout is 750 ms.\n\nCreate an account with: terminal-email init".into()), attachments: vec![], html_body: None, ..first.clone() };
-    app.set_messages(vec![other, reply, first]);
+    let reply = Message { uid: 2, message_id: "reply@terminal-email".into(), references: vec![first.message_id.clone()], subject: "Re: Welcome to your terminal inbox".into(), timestamp: timestamp + 1, body: Some("Conversations stay together.\n\nUse [ and ] in the message view to move between messages in this thread.\n\nPress / to search the locally cached sender, recipients, subject, and message text.".into()), attachments: vec![], html_body: None, ..first.clone() };
+    let other = Message { uid: 3, message_id: "keys@terminal-email".into(), subject: "Make it yours: configurable Vim bindings".into(), timestamp: timestamp + 2, body: Some("Keybindings are commands grouped by context: global, folders, threads, message, and prompt.\n\nExample TOML:\n\n[keybindings.global]\n\"j\" = \"cursor.down\"\n\"gg\" = \"cursor.first\"\n\nThe default sequence timeout is 750 ms.\n\nCreate an account with: terminal-email init".into()), attachments: vec![], html_body: None, ..first.clone() };
+    let mut messages = vec![other, reply, first];
+    for message in &mut messages {
+        message.date = chrono::DateTime::from_timestamp(message.timestamp, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+    app.set_messages(messages);
     app.status("DEMO · Enter opens INBOX · ? help · q back/quit", false);
     Ok(app)
 }
@@ -808,6 +977,9 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
     let mut refreshed = Instant::now();
     let mut dirty = true;
     loop {
+        if app.check_grouping_date(chrono::Local::now().date_naive()) {
+            dirty = true;
+        }
         while let Some(result) = app.browser.poll() {
             match result {
                 Ok(()) => app.status("HTML email opened in your default browser.", false),
@@ -908,6 +1080,210 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    fn grouped_app() -> App {
+        use chrono::TimeZone;
+        let mut app = demo_app().unwrap();
+        app.grouping_date = chrono::NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+        app.view = View::Threads;
+        app.set_messages(vec![]);
+        let messages = [(1, 17), (2, 16), (3, 14), (4, 2)]
+            .into_iter()
+            .map(|(uid, day)| Message {
+                uid,
+                folder: "INBOX".into(),
+                uid_validity: 1,
+                timestamp: chrono::Local
+                    .with_ymd_and_hms(2026, 10, day, 12, 0, 0)
+                    .earliest()
+                    .unwrap()
+                    .timestamp(),
+                subject: format!("Message {uid}"),
+                body: Some("test body".into()),
+                ..Default::default()
+            })
+            .collect();
+        app.set_messages(messages);
+        app
+    }
+
+    #[test]
+    fn headings_collapse_and_message_actions_are_harmless() {
+        let mut app = grouped_app();
+        assert_eq!(app.rows.len(), 8);
+        assert_eq!(app.selected().unwrap().uid, 1);
+        app.command("cursor.first", None);
+        assert_eq!(app.rows[app.list_cursor], Row::Heading(Period::Today, 1));
+        assert!(app.selected().is_none());
+        let original_flags: Vec<_> = app.messages.iter().map(|m| (m.seen, m.starred)).collect();
+        for command in [
+            "toggle_read",
+            "toggle_star",
+            "archive",
+            "trash",
+            "reply",
+            "reply_all",
+            "forward",
+            "attachment.save",
+        ] {
+            assert!(app.command(command, None).is_none());
+        }
+        assert_eq!(app.messages.len(), 4);
+        assert_eq!(
+            app.messages
+                .iter()
+                .map(|m| (m.seen, m.starred))
+                .collect::<Vec<_>>(),
+            original_flags
+        );
+        assert!(app.prompt.is_none());
+        app.command("open", None);
+        assert_eq!(app.view, View::Threads);
+        assert!(app.collapsed.contains(&Period::Today));
+        assert_eq!(app.rows.len(), 7);
+        app.command("cursor.down", None);
+        assert_eq!(
+            app.rows[app.list_cursor],
+            Row::Heading(Period::Yesterday, 1)
+        );
+        app.command("cursor.up", None);
+        app.command("open", None);
+        app.command("cursor.down", None);
+        app.command("open", None);
+        assert_eq!(app.view, View::Message);
+        assert_eq!(app.selected().unwrap().uid, 1);
+        app.command("back", None);
+        assert_eq!(
+            app.rows[app.list_cursor],
+            Row::Conversation(app.thread_cursor)
+        );
+    }
+
+    #[test]
+    fn flat_and_grouped_modes_preserve_selection_and_config() {
+        let mut app = grouped_app();
+        app.command("search.next", None);
+        let uid = app.selected().unwrap().uid;
+        app.command("threads.toggle_time_grouping", None);
+        assert!(!app.time_grouping);
+        assert_eq!(app.rows.len(), 4);
+        assert_eq!(app.selected().unwrap().uid, uid);
+        assert!(app.config.display.time_grouping);
+        app.collapsed.insert(Period::Yesterday);
+        app.command("threads.toggle_time_grouping", None);
+        assert_eq!(app.selected().unwrap().uid, uid);
+        assert!(!app.collapsed.contains(&Period::Yesterday));
+
+        let mut config = app.config.clone();
+        config.display.time_grouping = false;
+        let mut flat = App::new(config, true, false).unwrap();
+        flat.set_messages(app.messages.clone());
+        assert!(!flat.time_grouping);
+        assert_eq!(flat.rows.len(), 4);
+    }
+
+    #[test]
+    fn search_skips_collapsed_rows_and_expands_new_results() {
+        let mut app = grouped_app();
+        app.command("cursor.first", None);
+        app.command("open", None);
+        app.command("search.next", None);
+        assert_eq!(app.selected().unwrap().uid, 2);
+        app.command("search.previous", None);
+        assert_eq!(app.selected().unwrap().uid, 4);
+        app.command("open", None);
+        app.command("search.next", None);
+        assert_eq!(app.selected().unwrap().uid, 1);
+        assert!(!app.collapsed.contains(&Period::Today));
+        app.command("back", None);
+        app.collapsed.insert(Period::Today);
+        app.search("Message 1".into(), None);
+        assert!(app.collapsed.is_empty());
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.selected().unwrap().uid, 1);
+        app.command("back", None);
+        assert_eq!(app.groups.len(), 4);
+        app.search("no matching message".into(), None);
+        assert!(app.rows.is_empty());
+        app.command("cursor.last", None);
+        app.command("open", None);
+        app.command("search.next", None);
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn refresh_and_midnight_reveal_selected_conversation() {
+        let mut app = grouped_app();
+        let mut messages = app.messages.clone();
+        // Move the selected conversation into a currently collapsed section.
+        app.collapsed.insert(Period::Yesterday);
+        messages[0].timestamp = messages[1].timestamp;
+        app.set_messages(messages.clone());
+        assert_eq!(app.selected().unwrap().uid, 1);
+        assert!(!app.collapsed.contains(&Period::Yesterday));
+        app.collapsed.insert(Period::ThisWeek);
+        let tomorrow = app.grouping_date.succ_opt().unwrap();
+        assert!(app.check_grouping_date(tomorrow));
+        assert_eq!(app.selected().unwrap().uid, 1);
+        assert!(!app.collapsed.contains(&Period::ThisWeek));
+        assert!(!app.check_grouping_date(tomorrow));
+        // Refresh must preserve selected headings and their collapse state.
+        app.command("cursor.first", None);
+        let heading = app.rows[app.list_cursor];
+        app.command("open", None);
+        app.set_messages(messages);
+        assert_eq!(app.rows[app.list_cursor], heading);
+        assert!(app.selected().is_none());
+        // Removing the selected conversation leaves a valid neighboring selection.
+        app.command("open", None);
+        app.command("cursor.down", None);
+        let removed = app.selected().unwrap().uid;
+        app.set_messages(
+            app.messages
+                .iter()
+                .filter(|m| m.uid != removed)
+                .cloned()
+                .collect(),
+        );
+        assert!(app.list_cursor < app.rows.len());
+        assert!(app.selected().is_none_or(|m| m.uid != removed));
+    }
+
+    #[test]
+    fn folders_reset_collapse_state_and_keep_grouping_mode() {
+        let mut app = grouped_app();
+        app.command("threads.toggle_time_grouping", None);
+        app.collapsed.insert(Period::Today);
+        app.folders.push(Folder {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        app.command("back", None);
+        app.command("cursor.down", None);
+        app.command("open", None);
+        assert_eq!(app.active_folder, "Other");
+        assert!(!app.time_grouping);
+        assert!(app.collapsed.is_empty());
+        assert!(app.rows.is_empty());
+    }
+
+    #[test]
+    fn conversation_uses_newest_message_period_and_stays_intact() {
+        let mut app = grouped_app();
+        let mut messages = app.messages.clone();
+        messages[0].message_id = "new".into();
+        messages[3].references = vec!["new".into()];
+        app.set_messages(messages);
+        assert_eq!(app.groups.len(), 3);
+        let group = app.groups.iter().position(|g| g.len() == 2).unwrap();
+        assert_eq!(app.period(group), Period::Today);
+        assert!(app.rows.contains(&Row::Heading(Period::Today, 1)));
+        assert!(
+            !app.rows
+                .iter()
+                .any(|row| matches!(row, Row::Heading(Period::ThisMonth, _)))
+        );
+    }
 
     #[test]
     fn browser_fetches_legacy_html_once_and_opens_requested_identity() {

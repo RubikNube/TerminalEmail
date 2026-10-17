@@ -1,5 +1,6 @@
 use crate::{
     app::{App, Prompt, View},
+    grouping::Row,
     model::safe_text,
 };
 use ratatui::{
@@ -96,7 +97,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ),
             ]),
             Line::styled(
-                " j/k move  l open  h back  / search  c compose  ? help  Ctrl-c quit",
+                " j/k move  l open/fold  h back  t time groups  / search  c compose  ? help",
                 Style::default().fg(MUTED),
             ),
         ]),
@@ -174,15 +175,38 @@ fn message_list(frame: &mut Frame, app: &App, area: Rect) {
             app.groups.len()
         )
     };
+    let title = format!(
+        "{} · time grouping {} ",
+        title.trim_end(),
+        if app.time_grouping { "on" } else { "off" }
+    );
     let block = panel(title, app.view == View::Threads);
     if app.groups.is_empty() {
         frame.render_widget(Paragraph::new("\n  No messages to show.\n\n  Ctrl-r refreshes the mailbox.\n  Esc clears a search.\n  c starts a new message.").style(Style::default().fg(MUTED)).block(block), area);
         return;
     }
     let items = app
-        .groups
+        .rows
         .iter()
-        .map(|group| {
+        .map(|row| {
+            let group = match row {
+                Row::Heading(period, count) => {
+                    return ListItem::new(Line::styled(
+                        format!(
+                            "{} {} · {} conversations",
+                            if app.collapsed.contains(period) {
+                                "▸"
+                            } else {
+                                "▾"
+                            },
+                            period.label(),
+                            count
+                        ),
+                        Style::default().fg(GOLD).bold(),
+                    ));
+                }
+                Row::Conversation(group) => &app.groups[*group],
+            };
             let message = &app.messages[*group.last().unwrap()];
             let unread = group.iter().any(|&i| !app.messages[i].seen);
             let starred = group.iter().any(|&i| app.messages[i].starred);
@@ -223,7 +247,7 @@ fn message_list(frame: &mut Frame, app: &App, area: Rect) {
             .highlight_symbol("› ")
             .highlight_style(Style::default().bg(Color::Rgb(43, 61, 73))),
         area,
-        &mut ListState::default().with_selected(Some(app.thread_cursor)),
+        &mut ListState::default().with_selected(Some(app.list_cursor)),
     );
 }
 
@@ -395,6 +419,53 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn renders_grouping_collapsed_flat_and_empty_lists() {
+        for (width, height) in [(120, 40), (70, 24), (40, 12)] {
+            let mut app = crate::app::demo_app().unwrap();
+            app.view = View::Threads;
+            let mut unknown = app.messages[0].clone();
+            unknown.uid = 99;
+            unknown.message_id = "unknown".into();
+            unknown.references.clear();
+            unknown.timestamp = 0;
+            unknown.subject = "Undated mail".into();
+            let mut messages = app.messages.clone();
+            messages.push(unknown);
+            app.set_messages(messages);
+            app.command("cursor.first", None);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let rendered = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect()
+            };
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(rendered(&terminal).contains("Today"));
+            app.command("open", None);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(rendered(&terminal).contains("▸ Today"));
+            app.command("cursor.last", None);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(rendered(&terminal).contains("Undated mail"));
+            app.command("threads.toggle_time_grouping", None);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(!rendered(&terminal).contains("▸ Today"));
+            app.command("open", None);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(rendered(&terminal).contains("Undated mail"));
+            app.view = View::Threads;
+            app.set_messages(vec![]);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(rendered(&terminal).contains("No messages"));
+        }
+    }
+
     #[test]
     fn renders_normal_narrow_minimum_and_tiny_terminals() {
         for (width, height) in [(120, 40), (70, 24), (40, 12), (10, 3)] {

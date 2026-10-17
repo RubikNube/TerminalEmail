@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const COMMANDS: &[&str] = &[
+    "threads.toggle_time_grouping",
     "cursor.down",
     "cursor.up",
     "cursor.first",
@@ -79,6 +80,10 @@ pub fn defaults() -> Bindings {
             map.insert(key.into(), command.into());
         }
     }
+    bindings
+        .entry("threads".into())
+        .or_default()
+        .insert("t".into(), "threads.toggle_time_grouping".into());
     let message = bindings.entry("message".into()).or_default();
     message.insert("]".into(), "message.next".into());
     message.insert("[".into(), "message.previous".into());
@@ -297,6 +302,34 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouping_binding_is_thread_only_and_remappable() {
+        let mut map = KeyMap::new(&Bindings::new(), 750).unwrap();
+        let now = Instant::now();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(
+            map.feed("threads", key('t'), now).as_deref(),
+            Some("threads.toggle_time_grouping")
+        );
+        assert_eq!(map.feed("message", key('t'), now), None);
+        assert_eq!(map.feed("folders", key('t'), now), None);
+        let overrides = [(
+            "threads".into(),
+            [
+                ("t".into(), "unbound".into()),
+                ("T".into(), "threads.toggle_time_grouping".into()),
+            ]
+            .into(),
+        )]
+        .into();
+        let mut map = KeyMap::new(&overrides, 750).unwrap();
+        assert_eq!(map.feed("threads", key('t'), now), None);
+        assert_eq!(
+            map.feed("threads", key('T'), now).as_deref(),
+            Some("threads.toggle_time_grouping")
+        );
+    }
 
     #[test]
     fn browser_binding_is_message_only_and_remappable() {

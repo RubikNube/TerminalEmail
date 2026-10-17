@@ -36,7 +36,8 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `j` / `k` | Move or scroll |
 | `gg` / `G` | First / last |
 | `Ctrl-d` / `Ctrl-u` | Half-page down / up |
-| `Enter` / `l` | Open folder or conversation |
+| `Enter` / `l` | Open folder/conversation or expand/collapse a time section |
+| `t` | Toggle time grouping in the conversation list |
 | `h` / `Esc` / `q` | Back; quit from folders |
 | `Ctrl-c` | Quit |
 | `/` | Search cached mail in the active folder |
@@ -67,6 +68,21 @@ timeout_ms = 750
 ```
 
 Plain sequences such as `gg` are character sequences. For named or modified keys use tokens such as `Enter`, `Esc`, `Ctrl-r`, `Alt-j`, or `Ctrl-x Ctrl-r`. Ambiguous exact/prefix bindings wait for the configured timeout. `Esc` cancels a pending sequence. In text prompts, printable keys enter text, `Backspace` removes a character, `Enter` accepts, and `Esc` cancels. Confirmation prompts require `y` or `n`.
+
+## Time grouping
+
+Conversations appear under selectable time headings: Future, Today, Yesterday, This week, This month, Older, and Unknown date. Empty sections are hidden. Each conversation stays together under its newest message's date. Dates use your local timezone, with weeks starting Monday.
+
+Move to a heading with `j` / `k` and press `Enter` or `l` to collapse or expand it. Headings show conversation counts; message actions on headings do nothing. `n` / `N` skip collapsed conversations in the list. Search expands sections for the new results.
+
+Set the startup behavior in your existing `config.toml`:
+
+```toml
+[display]
+time_grouping = true # Default; set false for a flat list.
+```
+
+Press `t` to toggle grouping for the session. Remap it using `threads.toggle_time_grouping` under `[keybindings.threads]`. Session changes do not rewrite configuration. Collapsed sections reset when changing folders.
 
 ## Mail behavior
 

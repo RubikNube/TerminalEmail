@@ -20,6 +20,10 @@ tls = "starttls"
 [editor]
 # command = "vim" # Otherwise use $EDITOR, then vi. No shell expansion.
 
+[display]
+# Group conversations into selectable, collapsible time sections.
+time_grouping = true
+
 [keybindings]
 timeout_ms = 750
 
@@ -35,3 +39,6 @@ timeout_ms = 750
 "]" = "message.next"
 "[" = "message.previous"
 "S" = "attachment.save"
+
+[keybindings.threads]
+"t" = "threads.toggle_time_grouping"
