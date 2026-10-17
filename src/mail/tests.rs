@@ -345,6 +345,10 @@ impl MailBackend for FakeMail {
             .map(|mut m| {
                 if !body {
                     m.body = None;
+                    m.html_body = None;
+                    m.html_loaded = false;
+                } else {
+                    m.html_loaded = true;
                 }
                 m
             })
@@ -419,6 +423,23 @@ fn setup() -> (
         },
         receiver,
     )
+}
+
+#[tokio::test]
+async fn legacy_cached_text_refetches_html_then_uses_complete_cache() {
+    let (_temp, mut worker, mut updates) = setup();
+    let legacy = worker.backend.messages[0].clone();
+    worker.cache.put(&legacy).unwrap();
+    worker.backend.messages[0].html_body = Some("<p>Original HTML</p>".into());
+    worker.handle(Request::Body(legacy.clone())).await.unwrap();
+    let cached = worker.cache.message("INBOX", legacy.uid).unwrap().unwrap();
+    assert!(cached.html_loaded);
+    assert_eq!(cached.html_body.as_deref(), Some("<p>Original HTML</p>"));
+    assert!(matches!(updates.try_recv(), Ok(Update::Body(message)) if message.html_loaded));
+    // A known HTML result must avoid a second network fetch.
+    worker.backend.messages.clear();
+    worker.handle(Request::Body(legacy)).await.unwrap();
+    assert!(matches!(updates.try_recv(), Ok(Update::Body(message)) if message.html_body.is_some()));
 }
 
 #[tokio::test]
@@ -575,6 +596,7 @@ async fn until(events: &mut mpsc::UnboundedReceiver<String>, expected: &str) {
 #[tokio::test]
 async fn opening_during_header_batch_overtakes_remaining_sync_and_preserves_body() {
     let (_temp, mut worker, mut updates) = setup();
+    worker.backend.messages[0].html_body = Some("<p>Downloaded HTML</p>".into());
     let template = worker.backend.messages[0].clone();
     worker.backend.messages = (1..=201)
         .map(|uid| Message {
@@ -613,6 +635,9 @@ async fn opening_during_header_batch_overtakes_remaining_sync_and_preserves_body
     permits.send(()).await.unwrap();
     drop(requests);
     let worker = task.await.unwrap();
+    let cached = worker.cache.message("INBOX", 1).unwrap().unwrap();
+    assert_eq!(cached.html_body.as_deref(), Some("<p>Downloaded HTML</p>"));
+    assert!(cached.html_loaded);
     assert!(
         worker
             .cache

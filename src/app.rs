@@ -1,4 +1,5 @@
 use crate::{
+    browser::Browser,
     compose::{self, ComposeKind, Draft},
     config::Config,
     keys::KeyMap,
@@ -73,6 +74,8 @@ pub struct App {
     pub quit: bool,
     pub page_height: usize,
     body_states: HashMap<MessageKey, BodyState>,
+    browser: Browser,
+    browser_pending: HashSet<MessageKey>,
 }
 
 impl App {
@@ -99,6 +102,8 @@ impl App {
             demo,
             offline,
             body_states: HashMap::new(),
+            browser: Browser::default(),
+            browser_pending: HashSet::new(),
             quit: false,
             page_height: 20,
         })
@@ -203,7 +208,13 @@ impl App {
                 );
             }
             Update::Body(message) => {
-                if message.body.is_some() {
+                if message.html_loaded && self.browser_pending.remove(&message_key(&message)) {
+                    self.open_html(&message);
+                }
+                if message.body.is_some()
+                    && (!self.browser_pending.contains(&message_key(&message))
+                        || message.html_loaded)
+                {
                     self.body_states.remove(&message_key(&message));
                 }
                 if message.folder == self.active_folder
@@ -217,6 +228,12 @@ impl App {
             }
             Update::BodyError { message, error } => {
                 let key = message_key(&message);
+                if self.browser_pending.remove(&key) {
+                    self.status(
+                        format!("Cannot open HTML email: {error}. Press b to retry."),
+                        true,
+                    );
+                }
                 // A late failure must not replace a successfully loaded body.
                 if matches!(self.body_states.get(&key), Some(BodyState::Loading)) {
                     self.body_states.insert(key, BodyState::Failed(error));
@@ -231,6 +248,49 @@ impl App {
                 warning.is_some(),
             ),
             _ => {}
+        }
+    }
+
+    fn open_html(&mut self, message: &Message) {
+        let Some(html) = message.html_body.as_deref() else {
+            self.status("This message has no HTML body.", false);
+            return;
+        };
+        match self.browser.open(html) {
+            Ok(()) => self.status("Opening HTML email in your default browser…", false),
+            Err(error) => self.status(format!("Cannot open HTML email: {error:#}"), true),
+        }
+    }
+
+    fn open_browser(&mut self, worker: Option<&Worker>) {
+        let Some(message) = self.selected().cloned() else {
+            return;
+        };
+        if message.html_body.is_some() || message.html_loaded {
+            self.open_html(&message);
+        } else if self.offline {
+            self.status(
+                "HTML is not cached. Reconnect and press b to download it.",
+                true,
+            );
+        } else if self.demo {
+            self.status("This demo message has no HTML body.", false);
+        } else {
+            self.load_body(worker, &message);
+            let key = message_key(&message);
+            match self.body_states.get(&key) {
+                Some(BodyState::Loading) => {
+                    self.browser_pending.insert(key);
+                    self.status("Downloading HTML email to open in your browser…", false);
+                }
+                Some(BodyState::Failed(error)) => {
+                    self.status(
+                        format!("Cannot open HTML email: {error}. Press b to retry."),
+                        true,
+                    );
+                }
+                None => {}
+            }
         }
     }
 
@@ -482,6 +542,7 @@ impl App {
                     }
                 }
             }
+            "message.open_browser" if self.view == View::Message => self.open_browser(worker),
             "attachment.save" => {
                 if let Some(message) = self.selected() {
                     if message.attachments.is_empty() {
@@ -707,10 +768,12 @@ pub fn demo_app() -> Result<App> {
         from: "TerminalEmail <hello@example.org>".into(), to: "you@example.com".into(),
         subject: "Welcome to your terminal inbox".into(), date: "2026-10-17 10:00".into(), timestamp: 1,
         body: Some("Your inbox, at the speed of a keystroke.\n\nUse j/k to move, Enter or l to open, h or q to go back.\n\ngg and G jump to the first and last item. Ctrl-d/u scroll half a page.\n\nPress ? for every configured binding. Remap keys in config.toml.\n\nThis is an offline demo. No mail server is contacted.\n\nYou can save the attached example with S.\n\nHappy reading!".into()),
+        html_body: Some("<html><body><h1>Welcome to TerminalEmail</h1><p>Your inbox, at the speed of a keystroke.</p><p>Press <b>b</b> in the message view to open HTML in your browser.</p></body></html>".into()),
+        html_loaded: true,
         attachments: vec![Attachment { name: "welcome.txt".into(), content_type: "text/plain".into(), data: b"Welcome to TerminalEmail!\n".to_vec() }], ..Default::default()
     };
-    let reply = Message { uid: 2, message_id: "reply@terminal-email".into(), references: vec![first.message_id.clone()], subject: "Re: Welcome to your terminal inbox".into(), timestamp: 2, body: Some("Conversations stay together.\n\nUse [ and ] in the message view to move between messages in this thread.\n\nPress / to search the locally cached sender, recipients, subject, and message text.".into()), attachments: vec![], ..first.clone() };
-    let other = Message { uid: 3, message_id: "keys@terminal-email".into(), subject: "Make it yours: configurable Vim bindings".into(), timestamp: 3, body: Some("Keybindings are commands grouped by context: global, folders, threads, message, and prompt.\n\nExample TOML:\n\n[keybindings.global]\n\"j\" = \"cursor.down\"\n\"gg\" = \"cursor.first\"\n\nThe default sequence timeout is 750 ms.\n\nCreate an account with: terminal-email init".into()), attachments: vec![], ..first.clone() };
+    let reply = Message { uid: 2, message_id: "reply@terminal-email".into(), references: vec![first.message_id.clone()], subject: "Re: Welcome to your terminal inbox".into(), timestamp: 2, body: Some("Conversations stay together.\n\nUse [ and ] in the message view to move between messages in this thread.\n\nPress / to search the locally cached sender, recipients, subject, and message text.".into()), attachments: vec![], html_body: None, ..first.clone() };
+    let other = Message { uid: 3, message_id: "keys@terminal-email".into(), subject: "Make it yours: configurable Vim bindings".into(), timestamp: 3, body: Some("Keybindings are commands grouped by context: global, folders, threads, message, and prompt.\n\nExample TOML:\n\n[keybindings.global]\n\"j\" = \"cursor.down\"\n\"gg\" = \"cursor.first\"\n\nThe default sequence timeout is 750 ms.\n\nCreate an account with: terminal-email init".into()), attachments: vec![], html_body: None, ..first.clone() };
     app.set_messages(vec![other, reply, first]);
     app.status("DEMO · Enter opens INBOX · ? help · q back/quit", false);
     Ok(app)
@@ -745,6 +808,13 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
     let mut refreshed = Instant::now();
     let mut dirty = true;
     loop {
+        while let Some(result) = app.browser.poll() {
+            match result {
+                Ok(()) => app.status("HTML email opened in your default browser.", false),
+                Err(error) => app.status(format!("Cannot open HTML email: {error:#}"), true),
+            }
+            dirty = true;
+        }
         if let Some(worker) = worker.as_mut() {
             while let Ok(update) = worker.updates.try_recv() {
                 app.update(update, Some(worker));
@@ -838,6 +908,112 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn browser_fetches_legacy_html_once_and_opens_requested_identity() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        app.browser = crate::browser::fake();
+        let index = app.groups[app.thread_cursor][app.message_cursor];
+        app.messages[index].body = Some("Previously cached text".into());
+        app.messages[index].html_body = None;
+        app.messages[index].html_loaded = false;
+        let original = app.selected().unwrap().clone();
+        app.command("message.open_browser", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        // Flag updates reuse Body updates but may still contain legacy content.
+        app.update(Update::Body(Box::new(original.clone())), Some(&worker));
+        app.command("message.open_browser", Some(&worker));
+        assert!(requests.try_recv().is_err());
+        let mut loaded = original.clone();
+        loaded.html_body = Some("<p>Original HTML</p>".into());
+        loaded.html_loaded = true;
+        let mut unrelated = loaded.clone();
+        unrelated.uid_validity += 1;
+        app.update(Update::Body(Box::new(unrelated)), Some(&worker));
+        assert_eq!(app.browser.file_count(), 0);
+        // Navigation while loading must not open the newly selected message.
+        app.active_folder = "Other".into();
+        app.update(Update::Body(Box::new(loaded.clone())), Some(&worker));
+        assert_eq!(app.browser.file_count(), 1);
+        app.update(Update::Body(Box::new(loaded)), Some(&worker));
+        assert_eq!(app.browser.file_count(), 1);
+        assert!(app.browser_pending.is_empty());
+    }
+
+    #[test]
+    fn browser_handles_offline_plaintext_failure_and_retry() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        app.browser = crate::browser::fake();
+        let index = app.groups[app.thread_cursor][app.message_cursor];
+        app.messages[index].html_body = None;
+        app.messages[index].html_loaded = false;
+        let original = app.selected().unwrap().clone();
+        app.offline = true;
+        app.command("message.open_browser", Some(&worker));
+        assert!(app.status.contains("Reconnect"));
+        assert!(requests.try_recv().is_err());
+        app.messages[index].html_body = Some("<p>Cached HTML</p>".into());
+        app.command("message.open_browser", Some(&worker));
+        assert_eq!(app.browser.file_count(), 1);
+        app.messages[index].html_body = None;
+        app.messages[index].html_loaded = true;
+        app.command("message.open_browser", Some(&worker));
+        assert!(app.status.contains("no HTML body"));
+        app.messages[index].html_loaded = false;
+        app.offline = false;
+        // A full request queue must leave no pending browser launch.
+        worker
+            .requests
+            .try_send(Request::Refresh("INBOX".into()))
+            .unwrap();
+        app.command("message.open_browser", Some(&worker));
+        assert!(app.error);
+        assert!(app.browser_pending.is_empty());
+        requests.try_recv().unwrap();
+        app.command("message.open_browser", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        app.update(
+            Update::BodyError {
+                message: Box::new(original),
+                error: "Connection lost".into(),
+            },
+            Some(&worker),
+        );
+        assert!(app.error);
+        assert!(app.status.contains("Connection lost"));
+        assert!(app.browser_pending.is_empty());
+        app.command("message.open_browser", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        let mut plain = app.selected().unwrap().clone();
+        plain.body = Some("Plain text".into());
+        plain.html_loaded = true;
+        app.update(Update::Body(Box::new(plain)), Some(&worker));
+        assert!(app.status.contains("no HTML body"));
+        assert_eq!(app.browser.file_count(), 1);
+    }
+
+    #[test]
+    fn demo_browser_shortcut_launches_html_from_the_message_view() {
+        let mut app = demo_app().unwrap();
+        app.browser = crate::browser::fake();
+        app.command("open", None);
+        app.command("cursor.down", None);
+        app.command("open", None);
+        app.command("message.previous", None);
+        assert_eq!(app.selected().unwrap().uid, 1);
+        let command = app
+            .keys
+            .feed(
+                "message",
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                Instant::now(),
+            )
+            .unwrap();
+        app.command(&command, None);
+        assert_eq!(app.browser.file_count(), 1);
+        assert!(!app.error);
+    }
+
     #[test]
     fn prompt_and_help_respect_remapped_keys() {
         let mut app = demo_app().unwrap();

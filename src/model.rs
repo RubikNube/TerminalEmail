@@ -31,6 +31,10 @@ pub struct Message {
     pub seen: bool,
     pub starred: bool,
     pub body: Option<String>,
+    #[serde(default)]
+    pub html_body: Option<String>,
+    #[serde(default)]
+    pub html_loaded: bool,
     pub attachments: Vec<Attachment>,
 }
 
@@ -96,6 +100,16 @@ pub fn parse_message(raw: &[u8], uid: u32, folder: &str, validity: u32) -> Messa
         if let Some(id) = mail.in_reply_to().as_text() {
             result.references.push(id.to_owned());
         }
+        // body_html() also synthesizes HTML for plain-text messages. Keep only
+        // actual HTML MIME parts so plain-text mail gets the correct notice.
+        result.html_body = mail
+            .html_body
+            .iter()
+            .find_map(|&id| match &mail.part(id)?.body {
+                mail_parser::PartType::Html(html) => Some(html.to_string()),
+                _ => None,
+            });
+        result.html_loaded = true;
         result.body = mail.body_text(0).map(|s| safe_text(&s));
         if result.body.is_none() {
             result.body = mail.body_html(0).map(|html| {
@@ -170,9 +184,47 @@ pub fn threads(messages: &[Message]) -> Vec<Vec<usize>> {
 mod tests {
     use super::*;
     #[test]
+    fn preserves_html_alternative_and_reads_legacy_cache_payloads() {
+        let raw = b"MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nPlain alternative\r\n--x\r\nContent-Type: text/html\r\n\r\n<p>HTML alternative</p>\r\n--x--\r\n";
+        let message = parse_message(raw, 1, "INBOX", 1);
+        assert!(
+            message
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("Plain alternative")
+        );
+        assert!(
+            message
+                .html_body
+                .as_deref()
+                .unwrap()
+                .contains("<p>HTML alternative</p>")
+        );
+        assert!(message.html_loaded);
+        let mut payload = serde_json::to_value(&message).unwrap();
+        payload.as_object_mut().unwrap().remove("html_body");
+        payload.as_object_mut().unwrap().remove("html_loaded");
+        let legacy: Message = serde_json::from_value(payload).unwrap();
+        assert!(legacy.body.is_some());
+        assert!(legacy.html_body.is_none());
+        assert!(!legacy.html_loaded);
+        let plain = parse_message(b"Content-Type: text/plain\r\n\r\nHello", 2, "INBOX", 1);
+        assert!(plain.html_loaded);
+        assert!(plain.html_body.is_none());
+    }
+    #[test]
     fn parses_html_multipart_and_references_without_active_content() {
         let raw = b"From: \"Last, First\" <first@example.org>\r\nSubject: HTML test\r\nMessage-ID: <child@test>\r\nIn-Reply-To: <parent@test>\r\nReferences: <root@test> <parent@test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>Hello <b>world</b></p><script>secret_script()</script><img src=\"https://example.org/tracker\"></body></html>\r\n--x\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"test.txt\"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--x--\r\n";
         let message = parse_message(raw, 2, "INBOX", 1);
+        assert!(message.html_loaded);
+        assert!(
+            message
+                .html_body
+                .as_deref()
+                .unwrap()
+                .contains("secret_script()")
+        );
         assert!(message.from.starts_with("\"Last, First\""));
         let body = message.body.unwrap();
         assert!(body.contains("Hello"));

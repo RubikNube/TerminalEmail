@@ -47,6 +47,7 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `m` / `s` | Toggle read / starred on the selected message |
 | `a` / `d` | Archive / move selected message to Trash |
 | `S` | Save a downloaded attachment |
+| `b` | Open the current message’s HTML in the default browser |
 | `Ctrl-r` | Retry a missing message body, otherwise refresh |
 | `?` | Show configured bindings |
 
@@ -72,7 +73,8 @@ Plain sequences such as `gg` are character sequences. For named or modified keys
 - Folder headers and flags synchronize when opened and every 60 seconds. Bodies and attachments download on demand; previously downloaded content is readable offline. Opening messages takes priority between synchronization steps. If a body download fails, Ctrl-r in the message view retries it.
 - Conversations are grouped using Message-ID and References/In-Reply-To. Messages without usable identifiers remain separate.
 - Search uses SQLite FTS5 over cached sender, recipients, subject, and downloaded body text in the active folder. Words are combined with AND. Search can miss bodies which have never been downloaded. Back clears the search.
-- Plain text is preferred. HTML-only email is converted to text; remote images are never loaded, and terminal control characters are removed.
+- Plain text is preferred in the terminal. HTML-only email is converted to text; remote images are never loaded in the terminal, and terminal control characters are removed.
+- In the message view, press `b` to open original HTML in your Linux default browser through `xdg-open`. Remap it with `message.open_browser` under `[keybindings.message]`. The browser may load external images and other resources. Missing HTML (including older cached messages) downloads on demand when connected; cached HTML works offline. Plain-text-only messages show a status notice. Private temporary HTML files remain available until the app exits. Embedded `cid:` images are not extracted.
 - Archive/Trash/Sent destinations use SPECIAL-USE attributes. Set `archive_folder`, `trash_folder`, or `sent_folder` under `[account]` if needed. Moving requires IMAP MOVE or UIDPLUS support. Deletion moves mail to Trash after confirmation; there is no permanent-delete command.
 - Mailbox operations and sending require connectivity. They are never queued for later or automatically retried after failure.
 

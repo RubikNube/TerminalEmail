@@ -300,9 +300,14 @@ impl MailBackend for ImapSmtp {
             let mut message = parse_message(bytes, uid, folder, validity);
             if !body {
                 message.body = None;
+                message.html_body = None;
+                message.html_loaded = false;
                 message.attachments.clear();
-            } else if message.body.is_none() {
-                message.body = Some("(No readable text body)".into());
+            } else {
+                message.html_loaded = true;
+                if message.body.is_none() {
+                    message.body = Some("(No readable text body)".into());
+                }
             }
             message.seen = fetched.flags().any(|f| f == Flag::Seen);
             message.starred = fetched.flags().any(|f| f == Flag::Flagged);
@@ -620,6 +625,8 @@ impl<B: MailBackend> MailWorker<B> {
                         && old.uid_validity == validity
                     {
                         message.body = old.body;
+                        message.html_body = old.html_body;
+                        message.html_loaded = old.html_loaded;
                         message.attachments = old.attachments;
                     }
                     self.cache.put(&message)?;
@@ -641,10 +648,14 @@ impl<B: MailBackend> MailWorker<B> {
                 query,
             }),
             Request::Body(message) => {
-                if let Some(cached) = self
-                    .cache
-                    .message(&message.folder, message.uid)?
-                    .filter(|m| m.uid_validity == message.uid_validity && m.body.is_some())
+                if let Some(cached) =
+                    self.cache
+                        .message(&message.folder, message.uid)?
+                        .filter(|m| {
+                            m.uid_validity == message.uid_validity
+                                && m.body.is_some()
+                                && m.html_loaded
+                        })
                 {
                     self.emit(Update::Body(Box::new(cached)));
                     return Ok(());

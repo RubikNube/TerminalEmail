@@ -31,6 +31,7 @@ pub const COMMANDS: &[&str] = &[
     "trash",
     "message.next",
     "message.previous",
+    "message.open_browser",
     "attachment.save",
     "prompt.accept",
     "prompt.cancel",
@@ -82,6 +83,7 @@ pub fn defaults() -> Bindings {
     message.insert("]".into(), "message.next".into());
     message.insert("[".into(), "message.previous".into());
     message.insert("S".into(), "attachment.save".into());
+    message.insert("b".into(), "message.open_browser".into());
     bindings.insert(
         "prompt".into(),
         [
@@ -295,6 +297,33 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_binding_is_message_only_and_remappable() {
+        let mut map = KeyMap::new(&Bindings::new(), 750).unwrap();
+        let now = Instant::now();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(map.feed("threads", key('b'), now), None);
+        assert_eq!(
+            map.feed("message", key('b'), now).as_deref(),
+            Some("message.open_browser")
+        );
+        let overrides = [(
+            "message".into(),
+            [
+                ("b".into(), "unbound".into()),
+                ("v".into(), "message.open_browser".into()),
+            ]
+            .into(),
+        )]
+        .into();
+        let mut map = KeyMap::new(&overrides, 750).unwrap();
+        assert_eq!(map.feed("message", key('b'), now), None);
+        assert_eq!(
+            map.feed("message", key('v'), now).as_deref(),
+            Some("message.open_browser")
+        );
+    }
 
     #[test]
     fn sequences_timeout_and_context_override() {

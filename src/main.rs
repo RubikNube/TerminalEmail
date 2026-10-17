@@ -1,4 +1,5 @@
 mod app;
+mod browser;
 mod cache;
 mod compose;
 mod config;

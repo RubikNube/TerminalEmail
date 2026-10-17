@@ -191,7 +191,12 @@ mod tests {
         assert_eq!(cache.search("INBOX", "rust").unwrap().len(), 1);
         assert!(cache.search("INBOX", "hello").unwrap().is_empty());
         message.body = Some("hello from cache".into());
+        message.html_body = Some("<p>hello from cache</p>".into());
+        message.html_loaded = true;
         cache.put(&message).unwrap();
+        let cached = cache.message("INBOX", 42).unwrap().unwrap();
+        assert_eq!(cached.html_body, message.html_body);
+        assert!(cached.html_loaded);
         assert_eq!(cache.search("INBOX", "hello").unwrap().len(), 1);
         cache.check_validity("INBOX", 1).unwrap();
         assert!(cache.message("INBOX", 42).unwrap().unwrap().body.is_some());

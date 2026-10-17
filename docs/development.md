@@ -375,5 +375,8 @@ Linux Secret Service integration. OAuth2, offline mutation queues, outgoing
 attachments, a draft browser/resume workflow, and remote search are absent.
 The external editor supports composing replies and new messages; opening a
 received email in Neovim is not implemented. HTML is rendered as safe text,
-remote images are not fetched, and attachment saving never opens files
+remote images are not fetched in the terminal. The `b` shortcut opens original
+HTML using `xdg-open`, where the browser may fetch external resources. Private
+HTML files live until app exit. The `browser` module manages these files and
+reports launcher completion without blocking input. Attachment saving never opens files
 automatically. Archive/Trash moves require IMAP MOVE or UIDPLUS support.
