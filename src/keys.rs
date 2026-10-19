@@ -55,8 +55,7 @@ pub fn defaults() -> Bindings {
         ("l", "open"),
         ("h", "back"),
         ("Esc", "back"),
-        ("q", "back"),
-        ("Ctrl-c", "quit"),
+        ("q", "quit"),
         ("?", "help"),
         ("/", "search"),
         ("n", "search.next"),
@@ -92,6 +91,7 @@ pub fn defaults() -> Bindings {
     bindings.insert(
         "prompt".into(),
         [
+            ("q".into(), "unbound".into()),
             ("Enter".into(), "prompt.accept".into()),
             ("Esc".into(), "prompt.cancel".into()),
             ("Backspace".into(), "prompt.delete".into()),
@@ -302,6 +302,35 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_q_quits_by_default_outside_prompts() {
+        let mut map = KeyMap::new(&Bindings::new(), 750).unwrap();
+        let now = Instant::now();
+        for context in ["folders", "threads", "message", "prompt"] {
+            assert_eq!(
+                map.feed(
+                    context,
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    now
+                )
+                .as_deref(),
+                if context == "prompt" {
+                    None
+                } else {
+                    Some("quit")
+                }
+            );
+            assert_eq!(
+                map.feed(
+                    context,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    now
+                ),
+                None
+            );
+        }
+    }
 
     #[test]
     fn grouping_binding_is_thread_only_and_remappable() {

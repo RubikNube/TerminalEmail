@@ -568,7 +568,7 @@ impl App {
                     self.rebuild();
                 }
                 View::Threads => self.view = View::Folders,
-                View::Folders => self.quit = true,
+                View::Folders => {}
             },
             "search" => {
                 self.prompt = Some(Prompt::Search(self.search.clone()));
@@ -928,7 +928,7 @@ pub fn demo_app() -> Result<App> {
         uid: 1, folder: "INBOX".into(), uid_validity: 1, message_id: "welcome@terminal-email".into(),
         from: "TerminalEmail <hello@example.org>".into(), to: "you@example.com".into(),
         subject: "Welcome to your terminal inbox".into(), date: chrono::DateTime::from_timestamp(timestamp, 0).unwrap().with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(), timestamp,
-        body: Some("Your inbox, at the speed of a keystroke.\n\nUse j/k to move, Enter or l to open, h or q to go back.\n\ngg and G jump to the first and last item. Ctrl-d/u scroll half a page.\n\nPress ? for every configured binding. Remap keys in config.toml.\n\nThis is an offline demo. No mail server is contacted.\n\nYou can save the attached example with S.\n\nHappy reading!".into()),
+        body: Some("Your inbox, at the speed of a keystroke.\n\nUse j/k to move, Enter or l to open, h or Esc to go back, q to quit.\n\ngg and G jump to the first and last item. Ctrl-d/u scroll half a page.\n\nPress ? for every configured binding. Remap keys in config.toml.\n\nThis is an offline demo. No mail server is contacted.\n\nYou can save the attached example with S.\n\nHappy reading!".into()),
         html_body: Some("<html><body><h1>Welcome to TerminalEmail</h1><p>Your inbox, at the speed of a keystroke.</p><p>Press <b>b</b> in the message view to open HTML in your browser.</p></body></html>".into()),
         html_loaded: true,
         attachments: vec![Attachment { name: "welcome.txt".into(), content_type: "text/plain".into(), data: b"Welcome to TerminalEmail!\n".to_vec() }], ..Default::default()
@@ -944,7 +944,7 @@ pub fn demo_app() -> Result<App> {
             .to_string();
     }
     app.set_messages(messages);
-    app.status("DEMO · Enter opens INBOX · ? help · q back/quit", false);
+    app.status("DEMO · Enter opens INBOX · ? help · q quit", false);
     Ok(app)
 }
 
@@ -1534,6 +1534,63 @@ mod tests {
     }
 
     #[test]
+    fn back_keys_navigate_without_quitting_and_q_quits_every_view() {
+        for key in [KeyCode::Char('h'), KeyCode::Esc] {
+            let mut app = demo_app().unwrap();
+            app.command("open", None);
+            app.command("open", None);
+            assert_eq!(app.view, View::Message);
+            app.command("help", None);
+            for (view, help) in [
+                (View::Message, false),
+                (View::Threads, false),
+                (View::Folders, false),
+                (View::Folders, false),
+                (View::Folders, false),
+            ] {
+                let command = app
+                    .keys
+                    .feed(
+                        app.context(),
+                        KeyEvent::new(key, KeyModifiers::NONE),
+                        Instant::now(),
+                    )
+                    .unwrap();
+                app.command(&command, None);
+                assert_eq!(app.view, view);
+                assert_eq!(app.help, help);
+                assert!(!app.quit);
+            }
+        }
+        for view in [View::Folders, View::Threads, View::Message] {
+            for help in [false, true] {
+                let mut app = demo_app().unwrap();
+                app.view = view;
+                app.help = help;
+                let command = app
+                    .keys
+                    .feed(
+                        app.context(),
+                        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                        Instant::now(),
+                    )
+                    .unwrap();
+                app.command(&command, None);
+                assert!(app.quit);
+            }
+        }
+    }
+
+    #[test]
+    fn q_is_text_in_prompts() {
+        let mut app = demo_app().unwrap();
+        app.prompt = Some(Prompt::Search(String::new()));
+        app.prompt_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), None);
+        assert!(matches!(app.prompt, Some(Prompt::Search(ref input)) if input == "q"));
+        assert!(!app.quit);
+    }
+
+    #[test]
     fn demo_navigation_threading_search_and_flags() {
         let mut app = demo_app().unwrap();
         app.command("open", None);
@@ -1556,6 +1613,8 @@ mod tests {
         app.command("back", None);
         assert_eq!(app.view, View::Folders);
         app.command("back", None);
+        assert!(!app.quit);
+        app.command("quit", None);
         assert!(app.quit);
     }
 }

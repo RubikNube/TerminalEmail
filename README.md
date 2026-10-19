@@ -38,8 +38,8 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `Ctrl-d` / `Ctrl-u` | Half-page down / up |
 | `Enter` / `l` | Open folder/conversation or expand/collapse a time section |
 | `t` | Toggle time grouping in the conversation list |
-| `h` / `Esc` / `q` | Back; quit from folders |
-| `Ctrl-c` | Quit |
+| `h` / `Esc` | Back; stay open at folders |
+| `q` | Quit from any screen (type normally in prompts) |
 | `/` | Search cached mail in the active folder |
 | `n` / `N` | Next / previous result or conversation |
 | `[` / `]` | Previous / next message within a conversation |
