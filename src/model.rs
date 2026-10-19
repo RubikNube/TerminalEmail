@@ -1,3 +1,4 @@
+use base64::{Engine, alphabet, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -45,6 +46,41 @@ pub fn safe_text(value: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
+}
+
+/// Decode IMAP modified UTF-7 for display only; mailbox identities stay encoded.
+/// Keep malformed sequences verbatim and sanitize after decoding terminal controls.
+pub fn folder_display_name(value: &str) -> String {
+    let engine =
+        general_purpose::GeneralPurpose::new(&alphabet::IMAP_MUTF7, general_purpose::NO_PAD);
+    let mut decoded = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(start) = remaining.find('&') {
+        decoded.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('-') else {
+            break;
+        };
+        let encoded = &remaining[1..end];
+        if encoded.is_empty() {
+            decoded.push('&');
+        } else {
+            let text = engine.decode(encoded).ok().and_then(|bytes| {
+                if bytes.len() % 2 != 0 {
+                    return None;
+                }
+                let units: Vec<_> = bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect();
+                String::from_utf16(&units).ok()
+            });
+            decoded.push_str(text.as_deref().unwrap_or(&remaining[..=end]));
+        }
+        remaining = &remaining[end + 1..];
+    }
+    decoded.push_str(remaining);
+    safe_text(&decoded)
 }
 
 pub fn parse_message(raw: &[u8], uid: u32, folder: &str, validity: u32) -> Message {
@@ -183,6 +219,36 @@ pub fn threads(messages: &[Message]) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displays_modified_utf7_folder_names() {
+        for (encoded, expected) in [
+            ("Gel&APY-schte Elemente", "Gelöschte Elemente"),
+            ("&AOQA9gD8-", "äöü"),
+            ("&AMQA1gDc-", "ÄÖÜ"),
+            ("Projekte/&AOQ-/&APY-/&APw-", "Projekte/ä/ö/ü"),
+            ("A &- B", "A & B"),
+            ("&2D3eAA-", "😀"),
+            ("&U,BTFw-", "台北"),
+            ("INBOX", "INBOX"),
+            ("Gelöschte Elemente", "Gelöschte Elemente"),
+            ("", ""),
+        ] {
+            assert_eq!(folder_display_name(encoded), expected, "{encoded}");
+        }
+    }
+
+    #[test]
+    fn preserves_malformed_folder_names_and_sanitizes_decoded_controls() {
+        for malformed in [
+            "A & B", "&", "&APY", "&!!!-", "&AA-", "&2AA-", "&APY=-", "&APZ-",
+        ] {
+            assert_eq!(folder_display_name(malformed), malformed);
+        }
+        assert_eq!(folder_display_name("&!!!-/&APY-"), "&!!!-/ö");
+        assert_eq!(folder_display_name("A&ABsABwCF-B\x1b"), "AB");
+    }
+
     #[test]
     fn preserves_html_alternative_and_reads_legacy_cache_payloads() {
         let raw = b"MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nPlain alternative\r\n--x\r\nContent-Type: text/html\r\n\r\n<p>HTML alternative</p>\r\n--x--\r\n";

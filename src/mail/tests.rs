@@ -82,10 +82,10 @@ async fn real_imap_adapter_over_verified_tls() {
             let mut response = String::new();
             if command.starts_with("LOGIN ") {
             } else if command.starts_with("LIST ") {
-                response = "* LIST () \"/\" \"INBOX\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n".into();
+                response = "* LIST () \"/\" \"INBOX\"\r\n* LIST (\\Sent) \"/\" \"Gesendete &APY- Elemente\"\r\n".into();
             } else if command.starts_with("STATUS ") {
-                let name = if command.contains("\"Sent\"") {
-                    "Sent"
+                let name = if command.contains("\"Gesendete &APY- Elemente\"") {
+                    "Gesendete &APY- Elemente"
                 } else {
                     "INBOX"
                 };
@@ -149,6 +149,13 @@ async fn real_imap_adapter_over_verified_tls() {
         let folders = backend.folders().await.unwrap();
         assert_eq!(folders.len(), 2);
         assert_eq!(folders[1].role.as_deref(), Some("sent"));
+        assert_eq!(folders[1].name, "Gesendete &APY- Elemente");
+        assert_eq!(
+            folder_display_name(&folders[1].name),
+            "Gesendete ö Elemente"
+        );
+        assert_eq!(backend.unread(&folders[1].name).await.unwrap(), 1);
+        assert_eq!(backend.select(&folders[1].name, None).await.unwrap(), 7);
         assert_eq!(backend.select("INBOX", None).await.unwrap(), 7);
         assert_eq!(backend.uids().await.unwrap(), HashSet::from([7]));
         let headers = backend.fetch("INBOX", 7, &[7], false).await.unwrap();
@@ -158,7 +165,7 @@ async fn real_imap_adapter_over_verified_tls() {
         let bodies = backend.fetch("INBOX", 7, &[7], true).await.unwrap();
         assert_eq!(bodies[0].body.as_deref(), Some("Hello over TLS"));
         backend.flag(7, true, false).await.unwrap();
-        backend.move_to(7, "Archive").await.unwrap();
+        backend.move_to(7, &folders[1].name).await.unwrap();
         let outgoing = lettre::Message::builder()
             .from("a@example.org".parse().unwrap())
             .to("b@example.org".parse().unwrap())
@@ -171,6 +178,14 @@ async fn real_imap_adapter_over_verified_tls() {
     .unwrap();
     drop(backend);
     let transcript = server.await.unwrap();
+    for prefix in ["STATUS", "SELECT", "UID MOVE 7", "APPEND"] {
+        assert!(
+            transcript.iter().any(|command| {
+                command.starts_with(prefix) && command.contains("\"Gesendete &APY- Elemente\"")
+            }),
+            "Missing encoded mailbox in {prefix}: {transcript:?}"
+        );
+    }
     assert!(transcript.iter().any(|c| c.starts_with("UID MOVE 7")));
     assert!(
         transcript

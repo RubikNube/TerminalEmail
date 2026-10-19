@@ -1,7 +1,7 @@
 use crate::{
     app::{App, Prompt, View},
     grouping::Row,
-    model::safe_text,
+    model::{folder_display_name, safe_text},
 };
 use ratatui::{
     Frame,
@@ -116,7 +116,7 @@ fn folders(frame: &mut Frame, app: &App, area: Rect) {
         .folders
         .iter()
         .map(|folder| {
-            let name = safe_text(&folder.name);
+            let name = folder_display_name(&folder.name);
             let count = if folder.unread > 0 {
                 format!(" ({})", folder.unread)
             } else {
@@ -165,7 +165,7 @@ fn message_list(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.search.is_empty() {
         format!(
             " {} · {} conversations ",
-            safe_text(&app.active_folder),
+            folder_display_name(&app.active_folder),
             app.groups.len()
         )
     } else {
@@ -419,6 +419,30 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_decoded_folder_list_and_active_heading() {
+        let mut app = crate::app::demo_app().unwrap();
+        let encoded = "Gel&APY-schte Elemente";
+        app.folders[0].name = encoded.into();
+        app.active_folder = encoded.into();
+        app.view = View::Threads;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(rendered.matches("Gelöschte Elemente").count(), 2);
+        assert!(!rendered.contains("&APY-"));
+        assert_eq!(app.active_folder, encoded);
+        assert_eq!(app.folders[0].name, encoded);
+    }
+
     #[test]
     fn renders_grouping_collapsed_flat_and_empty_lists() {
         for (width, height) in [(120, 40), (70, 24), (40, 12)] {

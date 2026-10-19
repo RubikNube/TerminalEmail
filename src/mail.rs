@@ -2,7 +2,7 @@ use crate::{
     cache::Cache,
     compose::Draft,
     config::{Config, TlsMode},
-    model::{Folder, Message, parse_message, safe_text},
+    model::{Folder, Message, folder_display_name, parse_message, safe_text},
 };
 use anyhow::{Context, Result, bail};
 use async_imap::types::{Flag, NameAttribute};
@@ -455,7 +455,7 @@ impl<B: MailBackend> MailWorker<B> {
         }
         self.emit(Update::Status(format!(
             "Synchronizing {}…",
-            safe_text(&folder)
+            folder_display_name(&folder)
         )));
         self.jobs.push_front(SyncJob {
             folder,
