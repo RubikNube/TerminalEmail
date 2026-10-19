@@ -382,8 +382,9 @@ Passwords can be replaced with `cargo run -- set-password`.
 Current boundaries are one account, password/app-password authentication, and
 Linux Secret Service integration. OAuth2, offline mutation queues, outgoing
 attachments, a draft browser/resume workflow, and remote search are absent.
-The external editor supports composing replies and new messages; opening a
-received email in Neovim is not implemented. HTML is rendered as safe text,
+The external editor supports composing replies and new messages, and `e` opens
+a disposable copy of a received message's headers and text. The `editor` module
+shares the launcher and owns private temporary message copies. HTML is rendered as safe text,
 remote images are not fetched in the terminal. The `b` shortcut opens original
 HTML using `xdg-open`, where the browser may fetch external resources. Private
 HTML files live until app exit. The `browser` module manages these files and

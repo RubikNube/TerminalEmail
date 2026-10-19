@@ -88,6 +88,8 @@ pub struct App {
     body_states: HashMap<MessageKey, BodyState>,
     browser: Browser,
     browser_pending: HashSet<MessageKey>,
+    editor_pending: Option<(View, MessageKey)>,
+    editor_ready: Option<Message>,
 }
 
 impl App {
@@ -126,6 +128,8 @@ impl App {
             body_states: HashMap::new(),
             browser: Browser::default(),
             browser_pending: HashSet::new(),
+            editor_pending: None,
+            editor_ready: None,
             quit: false,
             page_height: 20,
         })
@@ -408,6 +412,7 @@ impl App {
     }
 
     pub fn update(&mut self, update: Update, worker: Option<&Worker>) {
+        self.validate_editor_request();
         match update {
             Update::Folders(folders) => {
                 self.folders = folders;
@@ -438,6 +443,14 @@ impl App {
                 );
             }
             Update::Body(message) => {
+                if message.body.is_some()
+                    && self
+                        .editor_pending
+                        .as_ref()
+                        .is_some_and(|(_, key)| *key == message_key(&message))
+                {
+                    self.editor_ready = Some(*message.clone());
+                }
                 if message.html_loaded && self.browser_pending.remove(&message_key(&message)) {
                     self.open_html(&message);
                 }
@@ -458,6 +471,18 @@ impl App {
             }
             Update::BodyError { message, error } => {
                 let key = message_key(&message);
+                if self
+                    .editor_pending
+                    .as_ref()
+                    .is_some_and(|(_, pending)| *pending == key)
+                {
+                    self.editor_pending = None;
+                    self.editor_ready = None;
+                    self.status(
+                        format!("Cannot open message in editor: {error}. Press e to retry."),
+                        true,
+                    );
+                }
                 if self.browser_pending.remove(&key) {
                     self.status(
                         format!("Cannot open HTML email: {error}. Press b to retry."),
@@ -478,6 +503,56 @@ impl App {
                 warning.is_some(),
             ),
             _ => {}
+        }
+        self.validate_editor_request();
+    }
+
+    fn validate_editor_request(&mut self) {
+        if self.editor_pending.as_ref().is_some_and(|(view, key)| {
+            self.view != *view
+                || self.active_folder != key.0
+                || self.help
+                || self.prompt.is_some()
+                || self.theme_picker.is_some()
+                || self.quit
+                || self
+                    .selected()
+                    .is_none_or(|message| message_key(message) != *key)
+        }) {
+            self.editor_pending = None;
+            self.editor_ready = None;
+        }
+    }
+
+    fn open_editor(&mut self, worker: Option<&Worker>) {
+        let Some(message) = self.selected().cloned() else {
+            return;
+        };
+        self.editor_pending = Some((self.view, message_key(&message)));
+        if message.body.is_some() {
+            self.editor_ready = Some(message);
+        } else if self.offline {
+            self.editor_pending = None;
+            self.status(
+                "Message body is not cached. Reconnect and press e to download it.",
+                true,
+            );
+        } else {
+            self.load_body(worker, &message);
+            match self.body_states.get(&message_key(&message)) {
+                Some(BodyState::Loading) => {
+                    self.status("Downloading message to open in your editor…", false)
+                }
+                Some(BodyState::Failed(error)) => {
+                    let error = error.clone();
+                    self.editor_pending = None;
+                    self.status(
+                        format!("Cannot open message in editor: {error}. Press e to retry."),
+                        true,
+                    );
+                }
+                None => self.editor_pending = None,
+            }
         }
     }
 
@@ -577,6 +652,13 @@ impl App {
     }
 
     pub fn command(&mut self, command: &str, worker: Option<&Worker>) -> Option<ComposeKind> {
+        self.validate_editor_request();
+        let result = self.apply_command(command, worker);
+        self.validate_editor_request();
+        result
+    }
+
+    fn apply_command(&mut self, command: &str, worker: Option<&Worker>) -> Option<ComposeKind> {
         if self.theme_picker.is_some() {
             self.theme_picker_command(command);
             return None;
@@ -770,6 +852,9 @@ impl App {
                 }
             }
             "compose" => return Some(ComposeKind::New),
+            "message.open_editor" if matches!(self.view, View::Threads | View::Message) => {
+                self.open_editor(worker)
+            }
             "reply" | "reply_all" | "forward" => {
                 if let Some(message) = self.selected() {
                     if message.body.is_none() {
@@ -1135,6 +1220,28 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
         }
         if app.quit {
             break;
+        }
+        app.validate_editor_request();
+        if let Some(message) = app.editor_ready.take() {
+            app.editor_pending = None;
+            let result = match crate::editor::MessageCopy::create(&message) {
+                Ok(copy) => {
+                    ratatui::restore();
+                    let edited = crate::editor::launch(&app.config, copy.path());
+                    terminal = ratatui::try_init()?;
+                    terminal.clear()?;
+                    edited
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => app.status(
+                    "Closed message copy. Changes to the copy are discarded.",
+                    false,
+                ),
+                Err(error) => app.status(format!("Cannot open message in editor: {error:#}"), true),
+            }
+            dirty = true;
         }
         if dirty {
             terminal.draw(|frame| crate::ui::draw(frame, &mut app))?;
@@ -1738,6 +1845,137 @@ mod tests {
         let (requests, receiver) = mpsc::channel(1);
         let (_sender, updates) = mpsc::unbounded_channel();
         (app, Worker { requests, updates }, receiver)
+    }
+
+    #[test]
+    fn editor_uses_list_latest_or_current_message_without_changing_state() {
+        let mut app = demo_app().unwrap();
+        app.view = View::Threads;
+        let group = app.groups.iter().position(|group| group.len() > 1).unwrap();
+        app.thread_cursor = group;
+        app.reveal_thread();
+        let latest = app.messages[*app.groups[group].last().unwrap()].uid;
+        app.scroll = 3;
+        app.command("message.open_editor", None);
+        assert_eq!(app.editor_ready.take().unwrap().uid, latest);
+        assert_eq!(app.view, View::Threads);
+        assert_eq!(app.scroll, 3);
+        assert!(app.prompt.is_none());
+        app.view = View::Message;
+        app.message_cursor = 0;
+        let original = app.selected().unwrap().clone();
+        app.command("message.open_editor", None);
+        assert_eq!(app.editor_ready.take().unwrap().uid, original.uid);
+        assert_eq!(app.selected().unwrap().seen, original.seen);
+        assert_eq!(app.selected().unwrap().starred, original.starred);
+        app.command("back", None);
+        assert!(app.editor_pending.is_none());
+        app.list_cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Heading(..)))
+            .unwrap();
+        app.command("message.open_editor", None);
+        assert!(app.editor_ready.is_none());
+        app.set_messages(vec![]);
+        app.command("message.open_editor", None);
+        assert!(app.editor_pending.is_none());
+        app.view = View::Folders;
+        app.command("message.open_editor", None);
+        assert!(app.editor_ready.is_none());
+    }
+
+    #[test]
+    fn editor_downloads_once_and_matches_full_identity() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        let mut message = app.selected().unwrap().clone();
+        app.command("message.open_editor", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        app.command("message.open_editor", Some(&worker));
+        assert!(requests.try_recv().is_err());
+        message.body = Some("Downloaded text".into());
+        for identity in 0..3 {
+            let mut other = message.clone();
+            match identity {
+                0 => other.uid += 100,
+                1 => other.uid_validity += 1,
+                _ => other.folder = "Other".into(),
+            }
+            app.update(Update::Body(Box::new(other)), Some(&worker));
+            assert!(app.editor_ready.is_none());
+        }
+        app.update(Update::Body(Box::new(message.clone())), Some(&worker));
+        assert_eq!(app.editor_ready.take().unwrap().body, message.body);
+        app.editor_pending = None; // The event loop consumes the launch.
+        app.update(Update::Body(Box::new(message)), Some(&worker));
+        assert!(app.editor_ready.is_none());
+    }
+
+    #[test]
+    fn editor_navigation_cancels_pending_launch_even_after_returning() {
+        for navigation in ["back", "message.next", "help", "theme.select", "search"] {
+            let (mut app, worker, mut requests) = reader_with_worker();
+            let mut loaded = app.selected().unwrap().clone();
+            app.command("message.open_editor", Some(&worker));
+            requests.try_recv().unwrap();
+            // Ensure message.next changes selection, even in a single-message thread.
+            if navigation == "message.next" {
+                app.view = View::Threads;
+                app.thread_cursor = app.groups.iter().position(|g| g.len() > 1).unwrap();
+                app.reveal_thread();
+                app.view = View::Message;
+                app.message_cursor = 0;
+                let index = app.groups[app.thread_cursor][0];
+                app.messages[index].body = None;
+                loaded = app.selected().unwrap().clone();
+                app.command("message.open_editor", Some(&worker));
+                let _ = requests.try_recv();
+            }
+            app.command(navigation, Some(&worker));
+            assert!(app.editor_pending.is_none(), "{navigation}");
+            loaded.body = Some("Late body".into());
+            app.update(Update::Body(Box::new(loaded)), Some(&worker));
+            assert!(app.editor_ready.is_none(), "{navigation}");
+        }
+    }
+
+    #[test]
+    fn editor_offline_download_errors_busy_worker_and_retry() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        app.offline = true;
+        app.command("message.open_editor", Some(&worker));
+        assert!(app.error && app.status.contains("Reconnect"));
+        assert!(app.editor_pending.is_none());
+        assert!(requests.try_recv().is_err());
+        let index = app.groups[app.thread_cursor][app.message_cursor];
+        app.messages[index].body = Some("Cached offline text".into());
+        app.command("message.open_editor", Some(&worker));
+        assert!(app.editor_ready.take().is_some());
+        app.editor_pending = None;
+        app.messages[index].body = None;
+        app.offline = false;
+        worker
+            .requests
+            .try_send(Request::Refresh("INBOX".into()))
+            .unwrap();
+        app.command("message.open_editor", Some(&worker));
+        assert!(app.error);
+        assert!(app.editor_pending.is_none());
+        requests.try_recv().unwrap();
+        app.command("message.open_editor", Some(&worker));
+        requests.try_recv().unwrap();
+        app.update(
+            Update::BodyError {
+                message: Box::new(app.selected().unwrap().clone()),
+                error: "Connection lost".into(),
+            },
+            Some(&worker),
+        );
+        assert!(app.status.contains("Connection lost"));
+        assert!(app.editor_pending.is_none());
+        app.command("message.open_editor", Some(&worker));
+        assert!(matches!(requests.try_recv(), Ok(Request::Body(_))));
+        assert!(app.editor_pending.is_some());
     }
 
     #[test]

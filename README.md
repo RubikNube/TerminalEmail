@@ -49,6 +49,7 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `a` / `d` | Archive / move selected message to Trash |
 | `S` | Save a downloaded attachment |
 | `b` | Open the current message’s HTML in the default browser |
+| `e` | Open a copy of the selected message in your editor |
 | `Ctrl-r` | Retry a missing message body, otherwise refresh |
 | `Space t` | Search and preview themes |
 | `?` | Show configured bindings |
@@ -145,6 +146,8 @@ Remap the opening shortcut using `theme.select` in `[keybindings.global]`. Picke
 - Mailbox operations and sending require connectivity. They are never queued for later or automatically retried after failure.
 
 ## Composing
+
+Press `e` in the conversation list or message view to open readable headers and message text in your editor. The list uses the conversation’s latest message. Configure `[editor].command = "nvim"` (or `"vim"`), or set `$EDITOR`; the fallback is `vi`. Remap `message.open_editor` under `[keybindings.threads]` and `[keybindings.message]`. Missing bodies download on demand; changing selection or view cancels the pending editor launch. Cached bodies work offline. Exit the editor to return to the same view. The private temporary copy and editor backups in its directory are removed on exit; saving does not change or send the stored email.
 
 The client temporarily releases the terminal and opens a draft using `[editor].command`, then `$EDITOR`, then `vi`. Editor commands are split into arguments without a shell. Edit the `To`, `Cc`, `Bcc`, and `Subject` headers, preserve the blank line, and write the message body below it. Save and exit the editor, then review and confirm sending in the client. Bcc recipients are included in the SMTP envelope but omitted from transmitted headers.
 

@@ -115,26 +115,8 @@ impl Draft {
     }
 
     pub fn edit(&self, config: &Config) -> Result<()> {
-        let command = config
-            .editor
-            .command
-            .clone()
-            .or_else(|| std::env::var("EDITOR").ok())
-            .unwrap_or_else(|| "vi".into());
-        let words = shell_words::split(&command).context("Invalid editor command")?;
-        let executable = words.first().context("Editor command is empty")?;
-        let status = std::process::Command::new(executable)
-            .args(&words[1..])
-            .arg(&self.path)
-            .status()
-            .context("Cannot launch editor")?;
-        if !status.success() {
-            bail!(
-                "Editor exited with {status}; draft saved at {}",
-                self.path.display()
-            );
-        }
-        Ok(())
+        crate::editor::launch(config, &self.path)
+            .with_context(|| format!("Draft retained at {}", self.path.display()))
     }
 
     pub fn build(&self, config: &Config) -> Result<Outgoing> {

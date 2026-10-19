@@ -39,6 +39,7 @@ pub const COMMANDS: &[&str] = &[
     "message.next",
     "message.previous",
     "message.open_browser",
+    "message.open_editor",
     "attachment.save",
     "prompt.accept",
     "prompt.cancel",
@@ -78,6 +79,7 @@ pub fn defaults() -> Bindings {
             ("r", "reply"),
             ("R", "reply_all"),
             ("f", "forward"),
+            ("e", "message.open_editor"),
             ("m", "toggle_read"),
             ("s", "toggle_star"),
             ("a", "archive"),
@@ -342,6 +344,41 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_shortcut_defaults_and_context_remapping() {
+        let now = Instant::now();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut keys = KeyMap::new(&Bindings::new(), 750).unwrap();
+        for context in ["threads", "message"] {
+            assert_eq!(
+                keys.feed(context, key('e'), now).as_deref(),
+                Some("message.open_editor")
+            );
+        }
+        assert!(keys.feed("folders", key('e'), now).is_none());
+        let bindings = ["threads", "message"]
+            .into_iter()
+            .map(|context| {
+                (
+                    context.into(),
+                    [
+                        ("e".into(), "unbound".into()),
+                        ("v".into(), "message.open_editor".into()),
+                    ]
+                    .into(),
+                )
+            })
+            .collect();
+        let mut keys = KeyMap::new(&bindings, 750).unwrap();
+        for context in ["threads", "message"] {
+            assert!(keys.feed(context, key('e'), now).is_none());
+            assert_eq!(
+                keys.feed(context, key('v'), now).as_deref(),
+                Some("message.open_editor")
+            );
+        }
+    }
 
     #[test]
     fn theme_shortcut_is_global_remappable_and_picker_is_isolated() {

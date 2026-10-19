@@ -3,6 +3,7 @@ mod browser;
 mod cache;
 mod compose;
 mod config;
+mod editor;
 mod grouping;
 mod keys;
 mod mail;

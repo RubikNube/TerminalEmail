@@ -18,7 +18,7 @@ port = 587
 tls = "starttls"
 
 [editor]
-# command = "vim" # Otherwise use $EDITOR, then vi. No shell expansion.
+# command = "nvim" # For message viewing and composing. Otherwise $EDITOR, then vi. No shell expansion.
 
 [display]
 # Built-in IDs: default, dark, light, matrix; or a filename stem in themes/ beside this file.
@@ -39,11 +39,13 @@ timeout_ms = 750
 # "x" = "unbound"
 
 [keybindings.message]
+"e" = "message.open_editor"
 "]" = "message.next"
 "[" = "message.previous"
 "S" = "attachment.save"
 
 [keybindings.threads]
+"e" = "message.open_editor"
 "t" = "threads.toggle_time_grouping"
 
 # Theme picker has isolated bindings: printable keys enter the query.
