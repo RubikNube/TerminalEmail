@@ -66,13 +66,11 @@ pub fn folder_display_name(value: &str) -> String {
             decoded.push('&');
         } else {
             let text = engine.decode(encoded).ok().and_then(|bytes| {
-                if bytes.len() % 2 != 0 {
+                let (pairs, remainder) = bytes.as_chunks::<2>();
+                if !remainder.is_empty() {
                     return None;
                 }
-                let units: Vec<_> = bytes
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-                    .collect();
+                let units: Vec<_> = pairs.iter().map(|pair| u16::from_be_bytes(*pair)).collect();
                 String::from_utf16(&units).ok()
             });
             decoded.push_str(text.as_deref().unwrap_or(&remaining[..=end]));
