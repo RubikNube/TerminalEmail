@@ -7,6 +7,7 @@ mod grouping;
 mod keys;
 mod mail;
 mod model;
+mod theme;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -149,15 +150,15 @@ fn init(path: &std::path::Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let path = cli.config.unwrap_or(config::config_path()?);
     if matches!(cli.command, Some(Command::Demo)) {
         ensure_terminal()?;
-        return app::run_demo();
+        return app::run_demo(&path);
     }
-    let path = cli.config.unwrap_or(config::config_path()?);
     match cli.command {
         Some(Command::Init) => init(&path),
         Some(Command::CheckConfig) => {
-            Config::load(&path)?;
+            Config::load(&path).and_then(|config| theme::check(&path, &config.display.theme))?;
             println!("Configuration valid: {}", path.display());
             Ok(())
         }
@@ -176,7 +177,7 @@ fn main() -> Result<()> {
             let config = Config::load(&path)?;
             ensure_terminal()?;
             let password = password(&config)?;
-            app::run(config, password)
+            app::run(config, password, &path)
         }
     }
 }

@@ -21,6 +21,8 @@ tls = "starttls"
 # command = "vim" # Otherwise use $EDITOR, then vi. No shell expansion.
 
 [display]
+# Built-in IDs: default, dark, light, matrix; or a filename stem in themes/ beside this file.
+theme = "default"
 # Group conversations into selectable, collapsible time sections.
 time_grouping = true
 
@@ -32,6 +34,7 @@ timeout_ms = 750
 "k" = "cursor.up"
 "gg" = "cursor.first"
 "G" = "cursor.last"
+"Space t" = "theme.select"
 # "Ctrl-j" = "cursor.down"
 # "x" = "unbound"
 
@@ -42,3 +45,11 @@ timeout_ms = 750
 
 [keybindings.threads]
 "t" = "threads.toggle_time_grouping"
+
+# Theme picker has isolated bindings: printable keys enter the query.
+# [keybindings.theme_picker]
+# "Ctrl-n" = "theme_picker.next"
+# "Ctrl-p" = "theme_picker.previous"
+# "Enter" = "theme_picker.accept"
+# "Esc" = "theme_picker.cancel"
+# "Backspace" = "theme_picker.delete"

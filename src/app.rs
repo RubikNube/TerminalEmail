@@ -6,6 +6,7 @@ use crate::{
     keys::KeyMap,
     mail::{self, Request, Update, Worker},
     model::{Attachment, Folder, Message, threads},
+    theme::{self, Picker, Theme},
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -53,6 +54,11 @@ enum BodyState {
 
 pub struct App {
     pub config: Config,
+    pub theme: Theme,
+    pub theme_id: String,
+    pub theme_warning: Option<String>,
+    pub theme_picker: Option<Picker>,
+    theme_config_path: Option<std::path::PathBuf>,
     pub keys: KeyMap,
     pub folders: Vec<Folder>,
     pub folder_cursor: usize,
@@ -87,6 +93,11 @@ pub struct App {
 impl App {
     pub fn new(config: Config, demo: bool, offline: bool) -> Result<Self> {
         Ok(Self {
+            theme: Theme::default(),
+            theme_id: "default".into(),
+            theme_warning: None,
+            theme_picker: None,
+            theme_config_path: None,
             keys: KeyMap::new(&config.keybindings.contexts, config.keybindings.timeout_ms)?,
             time_grouping: config.display.time_grouping,
             config,
@@ -121,7 +132,9 @@ impl App {
     }
 
     pub fn context(&self) -> &'static str {
-        if self.prompt.is_some() {
+        if self.theme_picker.is_some() {
+            "theme_picker"
+        } else if self.prompt.is_some() {
             "prompt"
         } else {
             match self.view {
@@ -129,6 +142,125 @@ impl App {
                 View::Threads => "threads",
                 View::Message => "message",
             }
+        }
+    }
+
+    pub fn load_themes(&mut self, path: &std::path::Path) {
+        self.theme_config_path = Some(path.to_path_buf());
+        let catalog = theme::discover(Some(path));
+        let requested = &self.config.display.theme;
+        let mut warnings = catalog.diagnostics;
+        if let Some(entry) = catalog
+            .entries
+            .iter()
+            .find(|e| &e.id == requested && e.theme.is_some())
+        {
+            self.theme = entry.theme.clone().unwrap();
+            self.theme_id = entry.id.clone();
+        } else {
+            self.theme = Theme::default();
+            self.theme_id = "default".into();
+            warnings.insert(
+                0,
+                format!("Unknown or invalid theme {requested:?}; using default"),
+            );
+        }
+        self.theme_warning = if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("; "))
+        };
+        if let Some(warning) = &self.theme_warning {
+            self.status(format!("Theme warning: {warning}"), true);
+        }
+    }
+
+    fn open_theme_picker(&mut self) {
+        let catalog = theme::discover(self.theme_config_path.as_deref());
+        let picker = Picker::new(catalog, self.theme.clone(), self.theme_id.clone());
+        self.theme = picker.preview();
+        self.theme_picker = Some(picker);
+        self.keys.reset();
+    }
+
+    fn theme_picker_command(&mut self, command: &str) {
+        let Some(mut picker) = self.theme_picker.take() else {
+            return;
+        };
+        match command {
+            "theme_picker.cancel" => {
+                self.theme = picker.original;
+                self.theme_id = picker.original_id;
+                self.keys.reset();
+                return;
+            }
+            "theme_picker.accept" => {
+                if let Some(entry) = picker.entry().filter(|e| e.theme.is_some()) {
+                    let saved = if self.demo {
+                        Ok(())
+                    } else {
+                        self.theme_config_path
+                            .as_deref()
+                            .context("No active configuration file")
+                            .and_then(|path| theme::save_selection(path, &entry.id))
+                    };
+                    match saved {
+                        Ok(()) => {
+                            self.theme_warning = None;
+                            self.theme_id = entry.id.clone();
+                            self.config.display.theme = entry.id.clone();
+                            self.theme = entry.theme.clone().unwrap();
+                            self.status(
+                                format!(
+                                    "Theme: {}{}",
+                                    entry.name,
+                                    if self.demo {
+                                        " (demo session only)"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                false,
+                            );
+                            self.keys.reset();
+                            return;
+                        }
+                        Err(error) => {
+                            picker.error = Some(format!("Could not save theme: {error:#}"))
+                        }
+                    }
+                }
+            }
+            "theme_picker.next" => {
+                picker.selected = (picker.selected + 1).min(picker.matches.len().saturating_sub(1))
+            }
+            "theme_picker.previous" => picker.selected = picker.selected.saturating_sub(1),
+            "theme_picker.delete" => {
+                picker.query.pop();
+                picker.filter();
+            }
+            _ => {}
+        }
+        self.theme = picker.preview();
+        self.theme_picker = Some(picker);
+    }
+
+    pub fn theme_picker_key(&mut self, key: KeyEvent) {
+        if let Some(command) = self.keys.feed("theme_picker", key, Instant::now()) {
+            self.theme_picker_command(&command);
+        } else if let KeyCode::Char(c) = key.code
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let Some(picker) = self.theme_picker.as_mut()
+        {
+            // Sequence prefixes are reserved for mapped commands, as in text prompts.
+            if self.keys.is_pending() {
+                return;
+            }
+            picker.query.push(c);
+            picker.filter();
+            self.theme = picker.preview();
         }
     }
 
@@ -445,6 +577,10 @@ impl App {
     }
 
     pub fn command(&mut self, command: &str, worker: Option<&Worker>) -> Option<ComposeKind> {
+        if self.theme_picker.is_some() {
+            self.theme_picker_command(command);
+            return None;
+        }
         let step = self.page_height.max(2) / 2;
         if self.help {
             match command {
@@ -460,6 +596,7 @@ impl App {
             return None;
         }
         match command {
+            "theme.select" if self.prompt.is_none() => self.open_theme_picker(),
             "threads.toggle_time_grouping" if self.view == View::Threads => {
                 self.time_grouping = !self.time_grouping;
                 self.reveal_thread();
@@ -948,14 +1085,17 @@ pub fn demo_app() -> Result<App> {
     Ok(app)
 }
 
-pub fn run_demo() -> Result<()> {
-    event_loop(demo_app()?, None)
+pub fn run_demo(path: &std::path::Path) -> Result<()> {
+    let mut app = demo_app()?;
+    app.load_themes(path);
+    event_loop(app, None)
 }
 
-pub fn run(config: Config, password: String) -> Result<()> {
+pub fn run(config: Config, password: String, config_path: &std::path::Path) -> Result<()> {
     let path = crate::config::cache_path(&config)?;
     let offline = password.is_empty();
-    let app = App::new(config.clone(), false, offline)?;
+    let mut app = App::new(config.clone(), false, offline)?;
+    app.load_themes(config_path);
     let worker = mail::start(config, password, path)?;
     worker
         .requests
@@ -1006,6 +1146,10 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     dirty = true;
+                    if app.theme_picker.is_some() {
+                        app.theme_picker_key(key);
+                        continue;
+                    }
                     if app.prompt.is_some() {
                         app.prompt_key(key, worker.as_ref());
                         continue;
@@ -1080,6 +1224,169 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    fn picker_key(app: &mut App, code: KeyCode) {
+        app.theme_picker_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn search_theme(app: &mut App, query: &str) {
+        let picker = app.theme_picker.as_mut().unwrap();
+        picker.query.clear();
+        picker.filter();
+        for ch in query.chars() {
+            picker_key(app, KeyCode::Char(ch));
+        }
+    }
+
+    #[test]
+    fn theme_picker_previews_cancels_and_owns_printable_input() {
+        let mut app = demo_app().unwrap();
+        app.view = View::Message;
+        app.scroll = 3;
+        let original = app.theme.clone();
+        app.command("theme.select", None);
+        assert_eq!(app.context(), "theme_picker");
+        search_theme(&mut app, "light");
+        assert_ne!(app.theme, original);
+        assert_eq!(app.theme_id, "default");
+        search_theme(&mut app, "jkq");
+        assert_eq!(app.theme_picker.as_ref().unwrap().query, "jkq");
+        assert!(!app.quit);
+        assert_eq!(app.theme, original);
+        picker_key(&mut app, KeyCode::Enter);
+        assert!(app.theme_picker.is_some());
+        picker_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.theme, original);
+        assert_eq!(app.context(), "message");
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn theme_selection_saves_and_restores_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alternate.toml");
+        std::fs::write(&path, include_str!("../config.example.toml")).unwrap();
+        let mut app = demo_app().unwrap();
+        app.demo = false;
+        app.load_themes(&path);
+        app.command("theme.select", None);
+        search_theme(&mut app, "light");
+        picker_key(&mut app, KeyCode::Enter);
+        assert!(app.theme_picker.is_none());
+        assert_eq!(app.theme_id, "light");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.display.theme, "light");
+        let mut restarted = App::new(config, false, true).unwrap();
+        restarted.load_themes(&path);
+        assert_eq!(restarted.theme, app.theme);
+        assert_eq!(restarted.theme_id, "light");
+    }
+
+    #[test]
+    fn theme_picker_save_failure_can_be_cancelled_and_demo_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let mut app = demo_app().unwrap();
+        app.load_themes(&missing);
+        app.demo = false;
+        let original = app.theme.clone();
+        app.command("theme.select", None);
+        search_theme(&mut app, "light");
+        picker_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.theme_picker
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Could not save")
+        );
+        assert_ne!(app.theme, original);
+        picker_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.theme, original);
+        app.demo = true;
+        app.command("theme.select", None);
+        search_theme(&mut app, "light");
+        picker_key(&mut app, KeyCode::Enter);
+        assert!(app.theme_picker.is_none());
+        assert_eq!(app.theme_id, "light");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn theme_picker_reloads_custom_files_and_handles_invalid_startup_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(theme::directory(&path)).unwrap();
+        let custom = theme::directory(&path).join("custom.toml");
+        std::fs::write(&custom, "name = 'First'").unwrap();
+        let mut app = demo_app().unwrap();
+        app.config.display.theme = "missing".into();
+        app.load_themes(&path);
+        assert!(app.error);
+        assert_eq!(app.theme_id, "default");
+        app.command("theme.select", None);
+        search_theme(&mut app, "custom");
+        assert_eq!(app.theme.name, "First");
+        picker_key(&mut app, KeyCode::Esc);
+        std::fs::write(&custom, "name = 'Second'").unwrap();
+        app.command("theme.select", None);
+        search_theme(&mut app, "custom");
+        assert_eq!(app.theme.name, "Second");
+        picker_key(&mut app, KeyCode::Esc);
+        std::fs::write(&custom, "invalid!").unwrap();
+        app.command("theme.select", None);
+        search_theme(&mut app, "custom");
+        assert_eq!(app.theme, Theme::default());
+        picker_key(&mut app, KeyCode::Enter);
+        assert!(app.theme_picker.is_some());
+        assert!(
+            app.theme_picker
+                .as_ref()
+                .unwrap()
+                .entry()
+                .unwrap()
+                .error
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn theme_picker_remapped_sequences_and_timeout_dispatch() {
+        let mut app = demo_app().unwrap();
+        let bindings = [(
+            "theme_picker".into(),
+            [
+                ("Enter".into(), "unbound".into()),
+                ("Ctrl-y".into(), "theme_picker.accept".into()),
+                ("Ctrl-x".into(), "theme_picker.next".into()),
+                ("Ctrl-x Ctrl-p".into(), "theme_picker.previous".into()),
+            ]
+            .into(),
+        )]
+        .into();
+        app.keys = KeyMap::new(&bindings, 50).unwrap();
+        app.command("theme.select", None);
+        let original_selected = app.theme_picker.as_ref().unwrap().selected;
+        app.theme_picker_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        let command = app
+            .keys
+            .expire("theme_picker", Instant::now() + Duration::from_millis(100))
+            .unwrap();
+        app.command(&command, None);
+        assert_eq!(
+            app.theme_picker.as_ref().unwrap().selected,
+            original_selected + 1
+        );
+        search_theme(&mut app, "light");
+        picker_key(&mut app, KeyCode::Enter);
+        assert!(app.theme_picker.is_some());
+        app.theme_picker_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.theme_picker.is_none());
+        assert!(!app.keys.is_pending());
+        assert_eq!(app.theme_id, "light");
+    }
 
     fn grouped_app() -> App {
         use chrono::TimeZone;

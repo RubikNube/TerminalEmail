@@ -1,0 +1,10 @@
+name = "Dark"
+[palette]
+background = "#1e1e2e"
+panel = "#181825"
+foreground = "#cdd6f4"
+muted = "#9399b2"
+accent = "#89b4fa"
+highlight = "#f9e2af"
+error = "#f38ba8"
+selection = "#45475a"

@@ -50,9 +50,10 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `S` | Save a downloaded attachment |
 | `b` | Open the current message’s HTML in the default browser |
 | `Ctrl-r` | Retry a missing message body, otherwise refresh |
+| `Space t` | Search and preview themes |
 | `?` | Show configured bindings |
 
-Contexts are `global`, `folders`, `threads`, `message`, and `prompt`. Context mappings override equivalent global mappings. Add or replace keys with command names displayed in `?` help:
+Contexts are `global`, `folders`, `threads`, `message`, `prompt`, and `theme_picker`. Context mappings override equivalent global mappings; the theme picker uses only its own bindings so printable keys remain search text. Add or replace keys with command names displayed in `?` help:
 
 ```toml
 [keybindings]
@@ -83,6 +84,55 @@ time_grouping = true # Default; set false for a flat list.
 ```
 
 Press `t` to toggle grouping for the session. Remap it using `threads.toggle_time_grouping` under `[keybindings.threads]`. Session changes do not rewrite configuration. Collapsed sections reset when changing folders.
+
+## Themes
+
+Press `Space` then `t` to open the theme picker from folders, conversations, or a message. Type to fuzzy-filter theme names and IDs; use Up/Down or Ctrl-p/Ctrl-n to browse. The highlighted theme previews immediately across the UI. Enter confirms and saves it; Escape restores the theme from before the picker opened. Letters such as `j`, `k`, and `q` enter the query. Backspace deletes a character.
+
+Four themes ship with the binary: `default` (the original appearance), `dark`, `light`, and `matrix` (green on black). Choose a startup theme with:
+
+```toml
+[display]
+theme = "default"
+```
+
+Confirmed selections update only `display.theme` in the active configuration file, preserving comments, unrelated settings, and file permissions. If saving fails, the picker stays open with an error; Escape still cancels the preview. Demo mode keeps selections for that session without writing configuration.
+
+Custom themes live in `themes/` beside the active configuration file, normally `~/.config/terminal-email/themes/`. With `--config /path/to/config.toml`, the directory is `/path/to/themes/`, including in demo mode. Each `.toml` file represents one theme; its filename stem is its ID. An optional `name` sets the display label. A custom file with a built-in ID overrides that built-in theme.
+
+Copy the annotated [complete theme template](themes/default.toml) into that directory as, for example, `my-theme.toml`, then edit it. Or start with a small partial theme:
+
+```toml
+name = "My Theme"
+
+[palette]
+background = "#12171f"
+foreground = "#d6dde8"
+accent = "#64d7cf"
+selection = "#2b3d49"
+
+[styles.folder_selection]
+fg = "$accent"
+bg = "$selection"
+bold = true
+```
+
+Palette colors accept `"#RRGGBB"`, an integer from 0 to 255, `"reset"` for the terminal default, or an ANSI name: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `dark_gray`, `light_red`, `light_green`, `light_yellow`, `light_blue`, `light_magenta`, `light_cyan`, `white`. Add reusable palette names and reference them with `$name`; palette entries can also reference each other, without cycles.
+
+Each `[styles.<role>]` accepts `fg`, `bg`, `bold`, `italic`, and `underline`. Colors can be literals or palette references; flags can be `true` or `false`. Roles cover background, panels, text, selections, borders, unread/read messages, starred indicators, time headings, errors, mode indicators, prompt input, and picker selection/matches; the template lists every role. Omitted palette entries inherit default colors. Omitted style fields inherit the default role definition resolved against your palette.
+
+Reopen the picker after editing files to load changes. Invalid files appear as disabled results with diagnostics. Missing or invalid startup themes use the embedded default and report a warning; invalid overrides leave their built-in theme available. `check-config` validates the selected theme and every discovered custom theme without contacting mail servers.
+
+Remap the opening shortcut using `theme.select` in `[keybindings.global]`. Picker actions are configured separately:
+
+```toml
+[keybindings.theme_picker]
+"Ctrl-n" = "theme_picker.next"
+"Ctrl-p" = "theme_picker.previous"
+"Enter" = "theme_picker.accept"
+"Esc" = "theme_picker.cancel"
+"Backspace" = "theme_picker.delete"
+```
 
 ## Mail behavior
 

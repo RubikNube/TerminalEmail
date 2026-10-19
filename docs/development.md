@@ -171,6 +171,7 @@ configuration file location, not the cache or draft directories.
 | Data | Default Linux location |
 | --- | --- |
 | Configuration | `~/.config/terminal-email/config.toml` |
+| Custom themes | `~/.config/terminal-email/themes/*.toml` (beside the active config) |
 | Mail cache | `~/.cache/terminal-email/<account-id>/mail.db` |
 | Retained drafts | `~/.local/share/terminal-email/drafts/draft-*.eml` |
 | Password | Secret Service entry with service `terminal-email` |
@@ -210,12 +211,12 @@ user data. Do not add credential or message-body logging when debugging.
 ## Configuration and input dispatch
 
 `Config::load` deserializes TOML and validates account settings, editor arguments,
-and bindings. Configuration is loaded at startup; there is no live reload. The
+and bindings. Configuration is loaded at startup. Theme files reload whenever the picker opens; other configuration has no live reload. The
 [example file](../config.example.toml) is the public configuration example.
 
 Bindings map key sequences to named commands in `global`, `folders`, `threads`,
-`message`, and `prompt` contexts. Context bindings override equivalent global
-sequences. `unbound` removes a binding's action. Equivalent spellings such as
+`message`, `prompt`, and `theme_picker` contexts. Context bindings override equivalent global
+sequences. The theme picker uses only its own bindings to reserve printable input for its query. `unbound` removes a binding's action. Equivalent spellings such as
 `gg` and `g g` can override defaults, but defining both in the same user context
 is rejected.
 
@@ -225,6 +226,14 @@ is 50–10000 ms. Escape cancels a pending sequence, and changing context clears
 pending input. Text prompts use `prompt.accept`, `prompt.cancel`, and
 `prompt.delete`; printable input is otherwise handled as text. Confirmation
 prompts additionally interpret `y` and `n`.
+
+### Themes
+
+`theme` parses TOML palettes and semantic styles, resolves inheritance from the embedded default, and discovers custom files beside the active config. Built-in TOML lives under `themes/` and is embedded with `include_str!`; custom themes do not need a binary rebuild. Unknown roles and fields, invalid colors, and missing or cyclic palette references are rejected. `check-config` validates all discovered files as well as the selected ID.
+
+`App` owns the resolved theme and a separate picker modal. `theme.select` (Space t) snapshots the current resolved theme; navigation and filtering preview another theme without changing the committed ID. Cancellation restores the snapshot, including when its source file has changed. Enter uses a comment-preserving `toml_edit` update, re-reading the active config and atomically replacing it through a temporary file in the same directory with the original permissions. Save failure keeps the picker open. Demo selections never write configuration.
+
+Picker input and timeout-dispatched commands use the same modal command handler. Its isolated key context prevents global mail operations from consuming search text. UI rendering uses named theme roles, including popups and small-terminal notices. Theme parsing, discovery, ranking, persistence, app workflows, and rendered colors are covered by unit and Ratatui buffer tests.
 
 ## Composition and send outcomes
 

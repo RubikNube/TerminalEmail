@@ -1,0 +1,65 @@
+# Copy this file to themes/<your-theme-id>.toml beside config.toml.
+# The filename is the ID; name is the display label. All fields are optional.
+name = "Default"
+
+# Colors: "#RRGGBB", ANSI names (e.g. "red", "light_cyan"), 0..255, or "reset".
+# Add your own palette names and refer to them with "$name" in styles.
+[palette]
+background = "#12171f"
+panel = "#19202a"
+foreground = "#d6dde8"
+muted = "#7f92a5"
+accent = "#64d7cf"
+highlight = "#efbb6f"
+error = "#ff8888"
+selection = "#2b3d49"
+
+# Omitted style fields inherit these defaults using your palette.
+# Each role accepts fg, bg, bold, italic, underline. Use false to disable a flag.
+[styles.background]
+fg = "$foreground"
+bg = "$background"
+[styles.panel]
+fg = "$foreground"
+bg = "$panel"
+[styles.text]
+fg = "$foreground"
+[styles.muted]
+fg = "$muted"
+[styles.accent]
+fg = "$accent"
+[styles.border_active]
+fg = "$accent"
+[styles.border_inactive]
+fg = "$muted"
+[styles.folder_selection]
+fg = "$accent"
+bg = "$selection"
+bold = true
+[styles.conversation_selection]
+bg = "$selection"
+[styles.unread]
+fg = "$foreground"
+bold = true
+[styles.read]
+fg = "$muted"
+[styles.starred]
+fg = "$highlight"
+[styles.time_heading]
+fg = "$highlight"
+bold = true
+[styles.error]
+fg = "$error"
+[styles.mode]
+fg = "$background"
+bg = "$accent"
+bold = true
+[styles.prompt_input]
+fg = "$accent"
+[styles.picker_selection]
+fg = "$accent"
+bg = "$selection"
+bold = true
+[styles.picker_match]
+fg = "$highlight"
+underline = true

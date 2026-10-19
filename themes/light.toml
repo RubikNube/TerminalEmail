@@ -1,0 +1,10 @@
+name = "Light"
+[palette]
+background = "#eff1f5"
+panel = "#e6e9ef"
+foreground = "#4c4f69"
+muted = "#6c6f85"
+accent = "#006b70"
+highlight = "#875300"
+error = "#b42335"
+selection = "#ccd0da"

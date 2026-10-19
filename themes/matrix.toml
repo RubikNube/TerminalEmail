@@ -1,0 +1,11 @@
+name = "Matrix"
+
+[palette]
+background = "#000000"
+panel = "#030a05"
+foreground = "#8bff9f"
+muted = "#5b9e68"
+accent = "#00ff41"
+highlight = "#c4ffd0"
+error = "#ff7777"
+selection = "#12351c"

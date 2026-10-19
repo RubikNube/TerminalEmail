@@ -21,12 +21,14 @@ pub struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Display {
+    pub theme: String,
     pub time_grouping: bool,
 }
 
 impl Default for Display {
     fn default() -> Self {
         Self {
+            theme: "default".into(),
             time_grouping: true,
         }
     }
@@ -168,6 +170,19 @@ pub fn private_dir(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn theme_defaults_and_type_validation() {
+        let text = include_str!("../config.example.toml");
+        let legacy: Config = toml::from_str(&text.replace("theme = \"default\"", "")).unwrap();
+        assert_eq!(legacy.display.theme, "default");
+        let custom: Config =
+            toml::from_str(&text.replace("theme = \"default\"", "theme = \"custom\"")).unwrap();
+        assert_eq!(custom.display.theme, "custom");
+        assert!(
+            toml::from_str::<Config>(&text.replace("theme = \"default\"", "theme = 42")).is_err()
+        );
+    }
+
+    #[test]
     fn time_grouping_defaults_and_toml_validation() {
         let text = include_str!("../config.example.toml");
         let defaulted: Config = toml::from_str(&text.replace("time_grouping = true", "")).unwrap();
@@ -175,6 +190,7 @@ mod tests {
         let legacy: Config = toml::from_str(
             &text
                 .replace("[display]", "")
+                .replace("theme = \"default\"", "")
                 .replace("time_grouping = true", ""),
         )
         .unwrap();

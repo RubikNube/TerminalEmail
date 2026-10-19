@@ -7,6 +7,12 @@ use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const COMMANDS: &[&str] = &[
+    "theme.select",
+    "theme_picker.next",
+    "theme_picker.previous",
+    "theme_picker.accept",
+    "theme_picker.cancel",
+    "theme_picker.delete",
     "threads.toggle_time_grouping",
     "cursor.down",
     "cursor.up",
@@ -45,6 +51,7 @@ pub fn defaults() -> Bindings {
     let mut bindings = Bindings::new();
     let global = bindings.entry("global".into()).or_default();
     for (key, command) in [
+        ("Space t", "theme.select"),
         ("j", "cursor.down"),
         ("k", "cursor.up"),
         ("gg", "cursor.first"),
@@ -97,6 +104,21 @@ pub fn defaults() -> Bindings {
             ("Backspace".into(), "prompt.delete".into()),
         ]
         .into(),
+    );
+    bindings.insert(
+        "theme_picker".into(),
+        [
+            ("Down", "theme_picker.next"),
+            ("Ctrl-n", "theme_picker.next"),
+            ("Up", "theme_picker.previous"),
+            ("Ctrl-p", "theme_picker.previous"),
+            ("Enter", "theme_picker.accept"),
+            ("Esc", "theme_picker.cancel"),
+            ("Backspace", "theme_picker.delete"),
+        ]
+        .into_iter()
+        .map(|(key, command)| (key.into(), command.into()))
+        .collect(),
     );
     bindings
 }
@@ -198,7 +220,16 @@ impl KeyMap {
     pub fn new(overrides: &Bindings, timeout_ms: u64) -> Result<Self> {
         let mut bindings = defaults();
         for (context, map) in overrides {
-            if !["global", "folders", "threads", "message", "prompt"].contains(&context.as_str()) {
+            if ![
+                "global",
+                "folders",
+                "threads",
+                "message",
+                "prompt",
+                "theme_picker",
+            ]
+            .contains(&context.as_str())
+            {
                 bail!("keybindings.{context}: unknown context");
             }
             let mut sequences = Vec::new();
@@ -225,6 +256,10 @@ impl KeyMap {
         })
     }
 
+    pub fn is_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub fn reset(&mut self) {
         self.pending.clear();
         self.deadline = None;
@@ -232,7 +267,12 @@ impl KeyMap {
 
     fn effective(&self, context: &str) -> Vec<(Vec<KeyEvent>, String)> {
         let mut result: Vec<(Vec<KeyEvent>, String)> = Vec::new();
-        for scope in ["global", context] {
+        let scopes = if context == "theme_picker" {
+            vec![context]
+        } else {
+            vec!["global", context]
+        };
+        for scope in scopes {
             if let Some(map) = self.bindings.get(scope) {
                 for (key, command) in map {
                     let sequence = parse_sequence(key).expect("validated key");
@@ -302,6 +342,60 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_shortcut_is_global_remappable_and_picker_is_isolated() {
+        let now = Instant::now();
+        let mut keys = KeyMap::new(&Bindings::new(), 750).unwrap();
+        for context in ["folders", "threads", "message"] {
+            assert_eq!(
+                keys.feed(
+                    context,
+                    KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                    now
+                ),
+                None
+            );
+            assert_eq!(
+                keys.feed(
+                    context,
+                    KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+                    now
+                )
+                .as_deref(),
+                Some("theme.select")
+            );
+        }
+        for c in ['j', 'k', 'q', 'c', '/', ' '] {
+            assert_eq!(
+                keys.feed(
+                    "theme_picker",
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                    now
+                ),
+                None
+            );
+        }
+        let overrides = [(
+            "global".into(),
+            [
+                ("Space t".into(), "unbound".into()),
+                ("T".into(), "theme.select".into()),
+            ]
+            .into(),
+        )]
+        .into();
+        let mut keys = KeyMap::new(&overrides, 750).unwrap();
+        assert_eq!(
+            keys.feed(
+                "message",
+                KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+                now
+            )
+            .as_deref(),
+            Some("theme.select")
+        );
+    }
 
     #[test]
     fn only_q_quits_by_default_outside_prompts() {
