@@ -137,7 +137,7 @@ Remap the opening shortcut using `theme.select` in `[keybindings.global]`. Picke
 
 ## Mail behavior
 
-- Folder headers and flags synchronize when opened and every 60 seconds. Bodies and attachments download on demand; previously downloaded content is readable offline. Opening messages takes priority between synchronization steps. If a body download fails, Ctrl-r in the message view retries it.
+- Folders synchronize when opened and every 60 seconds, fetching headers for new messages and flags for cached messages. Unchanged messages are not rewritten or reindexed. Bodies and attachments download on demand; previously downloaded content is readable offline. Opening messages takes priority between synchronization steps. If a body download fails, Ctrl-r in the message view retries it.
 - Conversations are grouped using Message-ID and References/In-Reply-To. Messages without usable identifiers remain separate.
 - Search uses SQLite FTS5 over cached sender, recipients, subject, and downloaded body text in the active folder. Words are combined with AND. Search can miss bodies which have never been downloaded. Back clears the search.
 - Plain text is preferred in the terminal. HTML-only email is converted to text; remote images are never loaded in the terminal, and terminal control characters are removed.

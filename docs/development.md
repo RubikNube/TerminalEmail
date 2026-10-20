@@ -84,7 +84,7 @@ a fake backend without involving the terminal.
 
 One worker owns the cache and IMAP session. Background synchronization is resumable:
 folder listing, each unread-count request, mailbox selection, UID search, and each
-100-message header batch yield to queued interactive requests. Interactive work
+100-message header or flag batch yield to queued interactive requests. Interactive work
 retains FIFO order, including mutations. An active network operation completes or
 times out before the next request runs; it is never cancelled to prioritize a read.
 The worker restores the selected mailbox and verifies UIDVALIDITY before resuming
@@ -99,7 +99,8 @@ it refreshes the active folder. Body results and errors are associated with the
 message identity so navigation does not redirect them to another message.
 
 The input loop polls at 50 ms intervals. While online, it requests a refresh of
-the active folder every 60 seconds. There is no IMAP IDLE subscription. An error
+the active folder every 60 seconds using `Sync`, which skips the initial cache
+snapshot. There is no IMAP IDLE subscription. An error
 or request timeout drops the IMAP session; a later request can reconnect, but the
 failed operation is not automatically retried.
 
@@ -108,7 +109,8 @@ failed operation is not automatically retried.
 Startup requests `Refresh("INBOX")`. `Refresh` publishes cached messages first,
 then lists remote folders and unread counts, persists SPECIAL-USE roles, and
 synchronizes the requested folder. `Load` publishes that folder's cache and
-synchronizes it without relisting folders. The following diagram shows `Load`
+synchronizes it without relisting folders. All three requests fetch headers only
+for uncached UIDs, then check flags for existing messages. The following diagram shows `Load`
 and the subsequent download of a body that is not already in memory.
 
 ```mermaid
@@ -124,17 +126,26 @@ sequenceDiagram
     W->>I: SELECT folder
     I-->>W: UIDVALIDITY
     W->>C: Check validity and invalidate stale data
-    W-->>A: Messages update after validity check
+    opt UIDVALIDITY changed
+        W-->>A: Empty snapshot invalidates old messages
+    end
     W->>I: UID SEARCH UNDELETED
     I-->>W: Current UIDs
     W->>C: Remove messages absent from remote results
-    loop Up to 100 UIDs per batch, newest first
+    W-->>A: Removed UIDs, if any
+    loop Up to 100 uncached UIDs per batch, newest first
         W->>I: UID FETCH flags and BODY.PEEK[HEADER]
         I-->>W: Headers and flags
         W->>C: Store messages, preserving downloaded bodies
         W-->>A: Messages update
     end
-    W-->>A: Final messages and status updates
+    loop Up to 100 cached UIDs per batch
+        W->>I: UID FETCH (UID FLAGS)
+        I-->>W: Flags
+        W->>C: Update only changed flags without rebuilding search index
+        W-->>A: Changed flags, if any
+    end
+    W-->>A: Completion status
     A->>W: Body(message)
     W->>C: Look for body with matching UIDVALIDITY
     alt Body cached
@@ -152,11 +163,21 @@ Interactive requests can run between the network steps shown above. A successful
 move discards any paused sync snapshot for its source folder and schedules a new
 sync rather than blocking other requests until reconciliation finishes.
 
-Each sync fetches headers and flags for the current undeleted UID set; it is not
-a delta sync based on modification sequences. Downloaded bodies and attachments
-survive header refreshes. `BODY.PEEK` avoids marking messages read as a fetch
-side effect; opening an unread message online separately requests a read-flag
-update.
+Each sync searches the current undeleted UID set, removes absent messages, and
+fetches headers only for UIDs missing from the cache. Existing UIDs receive
+flags-only fetches. Header batches use one cache transaction; flag changes update
+only the JSON flags, preserving downloaded content and the full-text index.
+Incremental UI updates carry additions, removals, and changed flags. An unchanged
+periodic sync emits no message updates, triggers no regrouping or search requests,
+and performs no message or search-index writes. This uses standard IMAP commands,
+without IDLE or modification-sequence extensions; the cache schema is unchanged.
+`BODY.PEEK` avoids marking messages read as a fetch side effect; opening an unread
+message online separately requests a read-flag update.
+
+A manual Linux CPU benchmark uses a 5,000-message warm cache and three unchanged
+refreshes, including app updates, with a deterministic backend and no network
+latency. Run `cargo test --release benchmark_warm_mailbox_sync -- --ignored --nocapture --test-threads=1` to print process CPU and elapsed time. It has no
+machine-dependent timing assertion and does not measure real-server performance.
 
 `App` groups messages using Message-ID, References, and In-Reply-To, including
 replies sharing a missing parent. Messages with no connecting identifiers remain

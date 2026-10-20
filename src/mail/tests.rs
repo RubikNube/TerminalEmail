@@ -97,18 +97,22 @@ async fn real_imap_adapter_over_verified_tls() {
             } else if command == "UID SEARCH UNDELETED" {
                 response = "* SEARCH 7\r\n".into();
             } else if command.starts_with("UID FETCH ") {
-                let body = command.contains("BODY.PEEK[]");
-                let header = "From: Alice <alice@example.org>\r\nTo: you@example.com\r\nSubject: TLS test\r\nMessage-ID: <tls@test>\r\nContent-Type: text/plain\r\n\r\n";
-                let content = if body {
-                    format!("{header}Hello over TLS")
+                if command.ends_with("(UID FLAGS)") {
+                    response = "* 1 FETCH (UID 7 FLAGS (\\Seen \\Flagged))\r\n* 2 FETCH (UID 99 FLAGS ())\r\n".into();
                 } else {
-                    header.into()
-                };
-                let section = if body { "" } else { "HEADER" };
-                response = format!(
-                    "* 1 FETCH (UID 7 FLAGS (\\Seen \\Flagged) BODY[{section}] {{{}}}\r\n{content})\r\n",
-                    content.len()
-                );
+                    let body = command.contains("BODY.PEEK[]");
+                    let header = "From: Alice <alice@example.org>\r\nTo: you@example.com\r\nSubject: TLS test\r\nMessage-ID: <tls@test>\r\nContent-Type: text/plain\r\n\r\n";
+                    let content = if body {
+                        format!("{header}Hello over TLS")
+                    } else {
+                        header.into()
+                    };
+                    let section = if body { "" } else { "HEADER" };
+                    response = format!(
+                        "* 1 FETCH (UID 7 FLAGS (\\Seen \\Flagged) BODY[{section}] {{{}}}\r\n{content})\r\n",
+                        content.len()
+                    );
+                }
             } else if command.starts_with("UID STORE ") || command.starts_with("UID MOVE ") {
             } else if command == "CAPABILITY" {
                 response = "* CAPABILITY IMAP4rev1 MOVE UIDPLUS\r\n".into();
@@ -158,6 +162,15 @@ async fn real_imap_adapter_over_verified_tls() {
         assert_eq!(backend.select(&folders[1].name, None).await.unwrap(), 7);
         assert_eq!(backend.select("INBOX", None).await.unwrap(), 7);
         assert_eq!(backend.uids().await.unwrap(), HashSet::from([7]));
+        assert!(backend.flags(&[]).await.unwrap().is_empty());
+        assert_eq!(
+            backend.flags(&[7]).await.unwrap(),
+            vec![MessageFlags {
+                uid: 7,
+                seen: true,
+                starred: true
+            }]
+        );
         let headers = backend.fetch("INBOX", 7, &[7], false).await.unwrap();
         assert_eq!(headers[0].subject, "TLS test");
         assert!(headers[0].seen && headers[0].starred);
@@ -303,7 +316,11 @@ impl FakeMail {
 impl MailBackend for FakeMail {
     async fn unread(&mut self, folder: &str) -> Result<u32> {
         self.record(format!("unread:{folder}")).await;
-        Ok(0)
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| m.folder == folder && !m.seen)
+            .count() as u32)
     }
     fn disconnect(&mut self) {
         self.selected.clear();
@@ -366,6 +383,19 @@ impl MailBackend for FakeMail {
                     m.html_loaded = true;
                 }
                 m
+            })
+            .collect())
+    }
+    async fn flags(&mut self, uids: &[u32]) -> Result<Vec<MessageFlags>> {
+        self.record(format!("flags:{}", self.selected)).await;
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| m.folder == self.selected && uids.contains(&m.uid))
+            .map(|m| MessageFlags {
+                uid: m.uid,
+                seen: m.seen,
+                starred: m.starred,
             })
             .collect())
     }
@@ -823,4 +853,215 @@ async fn foreground_mutations_keep_fifo_order_and_body_failure_is_not_retried() 
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].0.uid, 99);
     assert!(errors[0].1.contains("no longer exists"));
+}
+
+#[tokio::test]
+async fn unchanged_periodic_sync_only_fetches_flags_and_performs_no_cache_writes() {
+    let (_temp, mut worker, mut updates) = setup();
+    worker
+        .handle(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    finish_sync(&mut worker).await;
+    while updates.try_recv().is_ok() {}
+    let (sender, mut events) = mpsc::unbounded_channel();
+    worker.backend.events = Some(sender);
+    let writes = worker.cache.total_changes();
+    worker.handle(Request::Sync("INBOX".into())).await.unwrap();
+    finish_sync(&mut worker).await;
+    assert_eq!(worker.cache.total_changes(), writes);
+    let calls: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(calls.iter().any(|call| call == "flags:INBOX"));
+    assert!(!calls.iter().any(|call| call.starts_with("headers:")));
+    assert!(
+        !std::iter::from_fn(|| updates.try_recv().ok())
+            .any(|u| matches!(u, Update::Messages { .. } | Update::MessageChanges { .. }))
+    );
+}
+
+#[tokio::test]
+async fn incremental_sync_handles_new_flags_deleted_empty_and_new_identity() {
+    let (_temp, mut worker, mut updates) = setup();
+    worker
+        .handle(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    finish_sync(&mut worker).await;
+    let header = worker.cache.message("INBOX", 1).unwrap().unwrap();
+    worker.handle(Request::Body(header)).await.unwrap();
+    while updates.try_recv().is_ok() {}
+    worker.backend.messages[0].seen = true;
+    worker.backend.messages[0].starred = true;
+    let mut new = worker.backend.messages[0].clone();
+    new.uid = 2;
+    worker.backend.messages.push(new);
+    worker.handle(Request::Sync("INBOX".into())).await.unwrap();
+    finish_sync(&mut worker).await;
+    let cached = worker.cache.message("INBOX", 1).unwrap().unwrap();
+    assert!(cached.seen && cached.starred && cached.html_loaded);
+    assert_eq!(cached.body.as_deref(), Some("Downloaded text"));
+    assert_eq!(worker.cache.search("INBOX", "Downloaded").unwrap().len(), 1);
+    assert!(
+        worker
+            .cache
+            .message("INBOX", 2)
+            .unwrap()
+            .unwrap()
+            .body
+            .is_none()
+    );
+    let changes: Vec<_> = std::iter::from_fn(|| updates.try_recv().ok()).collect();
+    assert!(changes.iter().any(|u| matches!(u, Update::MessageChanges { added, .. } if added.len() == 1 && added[0].uid == 2)));
+    assert!(changes.iter().any(|u| matches!(u, Update::MessageChanges { flags, .. } if flags.len() == 1 && flags[0].uid == 1)));
+    worker.backend.messages.clear();
+    worker.handle(Request::Sync("INBOX".into())).await.unwrap();
+    finish_sync(&mut worker).await;
+    assert!(worker.cache.messages("INBOX").unwrap().is_empty());
+    assert!(
+        worker
+            .cache
+            .search("INBOX", "Downloaded")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::iter::from_fn(|| updates.try_recv().ok())
+            .any(|u| matches!(u, Update::MessageChanges { removed, .. } if removed.len() == 2))
+    );
+    // Reusing a UID after a validity change must fetch a fresh header and discard old bodies.
+    worker.backend.messages.push(cached.clone());
+    worker.handle(Request::Sync("INBOX".into())).await.unwrap();
+    finish_sync(&mut worker).await;
+    worker.cache.put(&cached).unwrap();
+    worker.backend.validity = 8;
+    worker.backend.messages[0].uid_validity = 8;
+    worker.backend.messages[0].subject = "New mailbox identity".into();
+    worker.handle(Request::Sync("INBOX".into())).await.unwrap();
+    finish_sync(&mut worker).await;
+    let fresh = worker.cache.message("INBOX", 1).unwrap().unwrap();
+    assert_eq!(fresh.uid_validity, 8);
+    assert_eq!(fresh.subject, "New mailbox identity");
+    assert!(fresh.body.is_none());
+    assert!(
+        worker
+            .cache
+            .search("INBOX", "Downloaded")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn opening_during_flag_scan_overtakes_remaining_batches() {
+    let (_temp, mut worker, _updates) = setup();
+    let template = worker.backend.messages[0].clone();
+    worker.backend.messages = (1..=201)
+        .map(|uid| Message {
+            uid,
+            ..template.clone()
+        })
+        .collect();
+    worker
+        .handle(Request::Refresh("INBOX".into()))
+        .await
+        .unwrap();
+    finish_sync(&mut worker).await;
+    let (mut events, permits) = observed(&mut worker, "flags:INBOX");
+    let (requests, receiver) = mpsc::channel(32);
+    requests.send(Request::Sync("INBOX".into())).await.unwrap();
+    let task = tokio::spawn(async move {
+        worker.run(receiver).await;
+        worker
+    });
+    until(&mut events, "flags:INBOX").await;
+    requests.send(Request::Body(template)).await.unwrap();
+    permits.send(()).await.unwrap();
+    assert_eq!(events.recv().await.as_deref(), Some("select:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("body:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("select:INBOX"));
+    assert_eq!(events.recv().await.as_deref(), Some("flags:INBOX"));
+    permits.send(()).await.unwrap();
+    until(&mut events, "flags:INBOX").await;
+    permits.send(()).await.unwrap();
+    drop(requests);
+    let worker = task.await.unwrap();
+    assert!(
+        worker
+            .cache
+            .message("INBOX", 1)
+            .unwrap()
+            .unwrap()
+            .html_loaded
+    );
+}
+
+/// Local CPU comparison with a warm cache and a deterministic, zero-latency backend.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "manual release-mode synchronization CPU benchmark"]
+async fn benchmark_warm_mailbox_sync() {
+    fn cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    }
+    let hz: f64 = String::from_utf8(
+        std::process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let (_temp, mut worker, mut updates) = setup();
+    let template = worker.backend.messages[0].clone();
+    worker.backend.messages = (1..=5000)
+        .map(|uid| Message {
+            uid,
+            message_id: format!("{uid}@test"),
+            timestamp: 1_700_000_000 + i64::from(uid),
+            ..template.clone()
+        })
+        .collect();
+    worker
+        .cache
+        .set_folders(&[Folder {
+            name: "INBOX".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+    worker.cache.check_validity("INBOX", 7).unwrap();
+    for message in &worker.backend.messages {
+        let mut header = message.clone();
+        header.body = None;
+        worker.cache.put(&header).unwrap();
+    }
+    let mut app = crate::app::demo_app().unwrap();
+    app.set_messages(worker.cache.messages("INBOX").unwrap());
+    let cpu_start = cpu_ticks();
+    let start = std::time::Instant::now();
+    for _ in 0..3 {
+        worker.handle(Request::Sync("INBOX".into())).await.unwrap();
+        while let Some(job) = worker.jobs.pop_front() {
+            if let Some(job) = worker.advance(job).await.unwrap() {
+                worker.jobs.push_front(job);
+            }
+            while let Ok(update) = updates.try_recv() {
+                app.update(update, None);
+            }
+        }
+    }
+    eprintln!(
+        "5000 messages, 3 unchanged refreshes: CPU {:.3}s, elapsed {:.3}s",
+        (cpu_ticks() - cpu_start) as f64 / hz,
+        start.elapsed().as_secs_f64()
+    );
 }

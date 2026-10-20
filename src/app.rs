@@ -285,6 +285,11 @@ impl App {
 
     pub fn set_messages(&mut self, messages: Vec<Message>) {
         let selected = self.selected().map(message_key);
+        self.messages = messages;
+        self.restore_messages_selection(selected);
+    }
+
+    fn restore_messages_selection(&mut self, selected: Option<MessageKey>) {
         let heading = if self.view == View::Threads {
             match self.rows.get(self.list_cursor) {
                 Some(Row::Heading(period, _)) => Some(*period),
@@ -293,7 +298,6 @@ impl App {
         } else {
             None
         };
-        self.messages = messages;
         self.rebuild();
         if let Some(key) = selected {
             if let Some((group, offset)) = self.groups.iter().enumerate().find_map(|(g, group)| {
@@ -421,6 +425,49 @@ impl App {
             Update::Messages { folder, messages } if folder == self.active_folder => {
                 self.set_messages(messages);
                 if !self.search.is_empty() {
+                    self.request(
+                        worker,
+                        Request::Search {
+                            folder,
+                            query: self.search.clone(),
+                        },
+                    );
+                }
+            }
+            Update::MessageChanges {
+                folder,
+                validity,
+                added,
+                flags,
+                removed,
+            } if folder == self.active_folder => {
+                let removed: HashSet<_> = removed.into_iter().collect();
+                let selected = self.selected().map(message_key);
+                let mut messages = std::mem::take(&mut self.messages);
+                messages.retain(|m| m.uid_validity == validity && !removed.contains(&m.uid));
+                let positions: std::collections::HashMap<_, _> = messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, m)| (m.uid, index))
+                    .collect();
+                for flag in flags {
+                    if let Some(&index) = positions.get(&flag.uid) {
+                        messages[index].seen = flag.seen;
+                        messages[index].starred = flag.starred;
+                    }
+                }
+                let search_changed = !added.is_empty() || !removed.is_empty();
+                for message in added {
+                    if let Some(&index) = positions.get(&message.uid) {
+                        messages[index] = message;
+                    } else {
+                        messages.push(message);
+                    }
+                }
+                messages.sort_unstable_by_key(|m| std::cmp::Reverse(m.uid));
+                self.messages = messages;
+                self.restore_messages_selection(selected);
+                if search_changed && !self.search.is_empty() {
                     self.request(
                         worker,
                         Request::Search {
@@ -1318,7 +1365,7 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
             }
         }
         if !app.demo && !app.offline && refreshed.elapsed() >= Duration::from_secs(60) {
-            app.request(worker.as_ref(), Request::Refresh(app.active_folder.clone()));
+            app.request(worker.as_ref(), Request::Sync(app.active_folder.clone()));
             refreshed = Instant::now();
         }
     }
@@ -1343,6 +1390,119 @@ mod tests {
         for ch in query.chars() {
             picker_key(app, KeyCode::Char(ch));
         }
+    }
+
+    #[test]
+    fn incremental_changes_preserve_reader_selection_body_and_search() {
+        let (mut app, worker, mut requests) = reader_with_worker();
+        let original = app.selected().unwrap().clone();
+        let index = app.groups[app.thread_cursor][app.message_cursor];
+        app.messages[index].body = Some("Downloaded body".into());
+        app.messages[index].html_loaded = true;
+        app.search = "test".into();
+        app.search_ids = Some(app.messages.iter().map(|m| m.uid).collect());
+        let mut added = original.clone();
+        added.uid = 999;
+        added.message_id = "new@test".into();
+        app.update(
+            Update::MessageChanges {
+                folder: original.folder.clone(),
+                validity: original.uid_validity,
+                added: vec![added],
+                flags: vec![crate::model::MessageFlags {
+                    uid: original.uid,
+                    seen: true,
+                    starred: true,
+                }],
+                removed: vec![],
+            },
+            Some(&worker),
+        );
+        assert_eq!(
+            app.selected().map(message_key),
+            Some(message_key(&original))
+        );
+        assert_eq!(app.view, View::Message);
+        assert_eq!(
+            app.selected().unwrap().body.as_deref(),
+            Some("Downloaded body")
+        );
+        assert!(app.selected().unwrap().starred);
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::Search { query, .. }) if query == "test")
+        );
+        // Flags alone do not change full-text search membership or trigger another search.
+        app.update(
+            Update::MessageChanges {
+                folder: original.folder.clone(),
+                validity: original.uid_validity,
+                added: vec![],
+                flags: vec![crate::model::MessageFlags {
+                    uid: original.uid,
+                    seen: false,
+                    starred: false,
+                }],
+                removed: vec![],
+            },
+            Some(&worker),
+        );
+        assert!(!app.selected().unwrap().seen);
+        assert!(requests.try_recv().is_err());
+        app.update(
+            Update::MessageChanges {
+                folder: "Other".into(),
+                validity: original.uid_validity,
+                added: vec![],
+                flags: vec![],
+                removed: vec![original.uid],
+            },
+            Some(&worker),
+        );
+        assert_eq!(
+            app.selected().map(message_key),
+            Some(message_key(&original))
+        );
+        app.update(
+            Update::MessageChanges {
+                folder: original.folder,
+                validity: original.uid_validity,
+                added: vec![],
+                flags: vec![],
+                removed: vec![original.uid],
+            },
+            Some(&worker),
+        );
+        assert!(!app.messages.iter().any(|m| m.uid == original.uid));
+        assert_eq!(app.view, View::Threads);
+    }
+
+    #[test]
+    fn incremental_changes_preserve_collapsed_heading_and_thread_membership() {
+        let mut app = grouped_app();
+        app.command("cursor.first", None);
+        app.command("open", None);
+        let heading = app.rows[app.list_cursor];
+        assert!(app.collapsed.contains(&Period::Today));
+        let original = app.messages[0].clone();
+        let mut reply = original.clone();
+        reply.uid = 100;
+        reply.message_id = "reply@test".into();
+        reply.references = vec!["original@test".into()];
+        let mut parent = original.clone();
+        parent.message_id = "original@test".into();
+        app.update(
+            Update::MessageChanges {
+                folder: original.folder,
+                validity: original.uid_validity,
+                added: vec![parent, reply],
+                flags: vec![],
+                removed: vec![],
+            },
+            None,
+        );
+        assert_eq!(app.rows[app.list_cursor], heading);
+        assert!(app.collapsed.contains(&Period::Today));
+        assert!(app.groups.iter().any(|g| g.len() == 2));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::{
     cache::Cache,
     compose::Draft,
     config::{Config, TlsMode},
-    model::{Folder, Message, folder_display_name, parse_message, safe_text},
+    model::{Folder, Message, MessageFlags, folder_display_name, parse_message, safe_text},
 };
 use anyhow::{Context, Result, bail};
 use async_imap::types::{Flag, NameAttribute};
@@ -22,6 +22,8 @@ type Session = async_imap::Session<tokio_native_tls::TlsStream<TcpStream>>;
 
 pub enum Request {
     Refresh(String),
+    /// Periodic refresh without republishing the full cache.
+    Sync(String),
     Load(String),
     Body(Message),
     Search {
@@ -48,6 +50,13 @@ pub enum Update {
     Messages {
         folder: String,
         messages: Vec<Message>,
+    },
+    MessageChanges {
+        folder: String,
+        validity: u32,
+        added: Vec<Message>,
+        flags: Vec<MessageFlags>,
+        removed: Vec<u32>,
     },
     Search {
         folder: String,
@@ -121,6 +130,7 @@ trait MailBackend {
         uids: &[u32],
         body: bool,
     ) -> Result<Vec<Message>>;
+    async fn flags(&mut self, uids: &[u32]) -> Result<Vec<MessageFlags>>;
     async fn flag(&mut self, uid: u32, starred: bool, value: bool) -> Result<()>;
     async fn move_to(&mut self, uid: u32, destination: &str) -> Result<()>;
     async fn send(&mut self, message: &lettre::Message) -> Result<()>;
@@ -316,6 +326,35 @@ impl MailBackend for ImapSmtp {
         Ok(messages)
     }
 
+    async fn flags(&mut self, uids: &[u32]) -> Result<Vec<MessageFlags>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let set = uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches: Vec<_> = self
+            .session()
+            .await?
+            .uid_fetch(set, "(UID FLAGS)")
+            .await?
+            .try_collect()
+            .await?;
+        Ok(fetches
+            .into_iter()
+            .filter_map(|fetched| {
+                let uid = fetched.uid.filter(|uid| uids.contains(uid))?;
+                Some(MessageFlags {
+                    uid,
+                    seen: fetched.flags().any(|f| f == Flag::Seen),
+                    starred: fetched.flags().any(|f| f == Flag::Flagged),
+                })
+            })
+            .collect())
+    }
+
     async fn flag(&mut self, uid: u32, starred: bool, value: bool) -> Result<()> {
         let flag = if starred { "\\Flagged" } else { "\\Seen" };
         let op = if value {
@@ -423,6 +462,7 @@ struct SyncJob {
     folder: String,
     phase: SyncPhase,
     validity: Option<u32>,
+    flags: VecDeque<Vec<u32>>,
 }
 
 enum SyncPhase {
@@ -431,6 +471,7 @@ enum SyncPhase {
     Select,
     Uids,
     Headers(VecDeque<Vec<u32>>),
+    Flags(VecDeque<Vec<u32>>),
 }
 
 impl<B: MailBackend> MailWorker<B> {
@@ -444,8 +485,10 @@ impl<B: MailBackend> MailWorker<B> {
         });
         Ok(())
     }
-    fn schedule(&mut self, folder: String, refresh: bool) -> Result<()> {
-        self.cached(&folder)?;
+    fn schedule(&mut self, folder: String, refresh: bool, snapshot: bool) -> Result<()> {
+        if snapshot {
+            self.cached(&folder)?;
+        }
         if let Some(job) = self.jobs.iter_mut().find(|job| job.folder == folder) {
             // A pending discovery already includes the requested synchronization.
             if refresh && matches!(job.phase, SyncPhase::Select) {
@@ -465,6 +508,7 @@ impl<B: MailBackend> MailWorker<B> {
                 SyncPhase::Select
             },
             validity: None,
+            flags: VecDeque::new(),
         });
         Ok(())
     }
@@ -542,13 +586,18 @@ impl<B: MailBackend> MailWorker<B> {
 
     fn enqueue(&mut self, request: Request, pending: &mut VecDeque<Request>) {
         match request {
+            Request::Sync(folder) => {
+                if let Err(error) = self.schedule(folder, true, false) {
+                    self.emit(Update::Error(error.to_string()));
+                }
+            }
             Request::Refresh(folder) => {
-                if let Err(error) = self.schedule(folder, true) {
+                if let Err(error) = self.schedule(folder, true, true) {
                     self.emit(Update::Error(error.to_string()));
                 }
             }
             Request::Load(folder) => {
-                if let Err(error) = self.schedule(folder, false) {
+                if let Err(error) = self.schedule(folder, false, true) {
                     self.emit(Update::Error(error.to_string()));
                 }
             }
@@ -572,7 +621,18 @@ impl<B: MailBackend> MailWorker<B> {
         }
         job.phase = match job.phase {
             SyncPhase::Discover => {
-                let folders = self.backend.folders().await?;
+                let mut folders = self.backend.folders().await?;
+                let counts: std::collections::HashMap<_, _> = self
+                    .cache
+                    .folders()?
+                    .into_iter()
+                    .map(|folder| (folder.name, folder.unread))
+                    .collect();
+                for folder in &mut folders {
+                    if let Some(&unread) = counts.get(&folder.name) {
+                        folder.unread = unread;
+                    }
+                }
                 self.cache.set_folders(&folders)?;
                 self.emit(Update::Folders(folders.clone()));
                 SyncPhase::Counts { folders, next: 0 }
@@ -592,26 +652,32 @@ impl<B: MailBackend> MailWorker<B> {
             }
             SyncPhase::Select => {
                 let validity = self.backend.select(&job.folder, None).await?;
-                self.cache.check_validity(&job.folder, validity)?;
-                self.cached(&job.folder)?;
+                if self.cache.check_validity(&job.folder, validity)? {
+                    self.cached(&job.folder)?;
+                }
                 job.validity = Some(validity);
                 self.selected = Some((job.folder.clone(), validity));
                 SyncPhase::Uids
             }
             SyncPhase::Uids => {
                 let remote = self.backend.uids().await?;
-                self.cache.reconcile(&job.folder, &remote)?;
-                self.cached(&job.folder)?;
-                let mut uids: Vec<_> = remote.into_iter().collect();
-                uids.sort_unstable_by(|a, b| b.cmp(a));
-                SyncPhase::Headers(uids.chunks(100).map(<[u32]>::to_vec).collect())
+                let removed = self.cache.reconcile(&job.folder, &remote)?;
+                let validity = job
+                    .validity
+                    .context("Missing synchronization mailbox identity")?;
+                self.changes(&job.folder, validity, Vec::new(), Vec::new(), removed);
+                let cached = self.cache.uids(&job.folder)?;
+                let mut new: Vec<_> = remote.difference(&cached).copied().collect();
+                let mut existing: Vec<_> = remote.intersection(&cached).copied().collect();
+                new.sort_unstable_by(|a, b| b.cmp(a));
+                existing.sort_unstable_by(|a, b| b.cmp(a));
+                job.flags = existing.chunks(100).map(<[u32]>::to_vec).collect();
+                SyncPhase::Headers(new.chunks(100).map(<[u32]>::to_vec).collect())
             }
             SyncPhase::Headers(mut chunks) => {
                 let Some(chunk) = chunks.pop_front() else {
-                    self.emit(Update::Status(
-                        "Synchronized · / searches cached mail · ? help".into(),
-                    ));
-                    return Ok(None);
+                    job.phase = SyncPhase::Flags(std::mem::take(&mut job.flags));
+                    return Ok(Some(job));
                 };
                 let validity = job
                     .validity
@@ -620,6 +686,7 @@ impl<B: MailBackend> MailWorker<B> {
                     .backend
                     .fetch(&job.folder, validity, &chunk, false)
                     .await?;
+                let mut added = Vec::new();
                 for mut message in updates {
                     if let Some(old) = self.cache.message(&job.folder, message.uid)?
                         && old.uid_validity == validity
@@ -629,19 +696,55 @@ impl<B: MailBackend> MailWorker<B> {
                         message.html_loaded = old.html_loaded;
                         message.attachments = old.attachments;
                     }
-                    self.cache.put(&message)?;
+                    added.push(message);
                 }
-                self.cached(&job.folder)?;
+                self.cache.put_batch(&added)?;
+                self.changes(&job.folder, validity, added, Vec::new(), Vec::new());
                 SyncPhase::Headers(chunks)
+            }
+            SyncPhase::Flags(mut chunks) => {
+                let Some(chunk) = chunks.pop_front() else {
+                    self.emit(Update::Status(
+                        "Synchronized · / searches cached mail · ? help".into(),
+                    ));
+                    return Ok(None);
+                };
+                let validity = job
+                    .validity
+                    .context("Missing synchronization mailbox identity")?;
+                let flags = self.backend.flags(&chunk).await?;
+                let changed = self.cache.update_flags(&job.folder, validity, &flags)?;
+                self.changes(&job.folder, validity, Vec::new(), changed, Vec::new());
+                SyncPhase::Flags(chunks)
             }
         };
         Ok(Some(job))
     }
 
+    fn changes(
+        &self,
+        folder: &str,
+        validity: u32,
+        added: Vec<Message>,
+        flags: Vec<MessageFlags>,
+        removed: Vec<u32>,
+    ) {
+        if !added.is_empty() || !flags.is_empty() || !removed.is_empty() {
+            self.emit(Update::MessageChanges {
+                folder: folder.into(),
+                validity,
+                added,
+                flags,
+                removed,
+            });
+        }
+    }
+
     async fn handle(&mut self, request: Request) -> Result<()> {
         match request {
-            Request::Refresh(folder) => self.schedule(folder, true)?,
-            Request::Load(folder) => self.schedule(folder, false)?,
+            Request::Sync(folder) => self.schedule(folder, true, false)?,
+            Request::Refresh(folder) => self.schedule(folder, true, true)?,
+            Request::Load(folder) => self.schedule(folder, false, true)?,
             Request::Search { folder, query } => self.emit(Update::Search {
                 messages: self.cache.search(&folder, &query)?,
                 folder,
@@ -706,7 +809,7 @@ impl<B: MailBackend> MailWorker<B> {
                 self.backend.move_to(message.uid, &destination).await?;
                 // Drop a paused UID snapshot which predates this mutation.
                 self.jobs.retain(|job| job.folder != message.folder);
-                self.schedule(message.folder, false)?;
+                self.schedule(message.folder, false, true)?;
             }
             Request::Send { draft, message } => {
                 self.emit(Update::Status("Sending message…".into()));

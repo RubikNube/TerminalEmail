@@ -1,6 +1,6 @@
 use crate::{
     config::private_dir,
-    model::{Folder, Message},
+    model::{Folder, Message, MessageFlags},
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
@@ -35,6 +35,11 @@ impl Cache {
         Ok(Self { db })
     }
 
+    #[cfg(test)]
+    pub fn total_changes(&self) -> u64 {
+        self.db.total_changes()
+    }
+
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let mut query = self
             .db
@@ -53,7 +58,7 @@ impl Cache {
     pub fn set_folders(&mut self, folders: &[Folder]) -> Result<()> {
         let tx = self.db.transaction()?;
         for folder in folders {
-            tx.execute("INSERT INTO folders(name, unread, role) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET unread=excluded.unread, role=excluded.role", params![folder.name, folder.unread, folder.role])?;
+            tx.execute("INSERT INTO folders(name, unread, role) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET unread=excluded.unread, role=excluded.role WHERE unread != excluded.unread OR role IS NOT excluded.role", params![folder.name, folder.unread, folder.role])?;
         }
         // Remove mailboxes which no longer exist, including their searchable data.
         let names: std::collections::HashSet<_> = folders.iter().map(|f| f.name.as_str()).collect();
@@ -72,23 +77,24 @@ impl Cache {
         Ok(())
     }
 
-    pub fn check_validity(&mut self, folder: &str, validity: u32) -> Result<()> {
+    pub fn check_validity(&mut self, folder: &str, validity: u32) -> Result<bool> {
         let previous: Option<u32> = self.db.query_row(
             "SELECT validity FROM folders WHERE name=?1",
             [folder],
             |r| r.get(0),
         )?;
-        let tx = self.db.transaction()?;
-        if previous != Some(validity) {
-            tx.execute("DELETE FROM messages WHERE folder=?1", [folder])?;
-            tx.execute("DELETE FROM search WHERE folder=?1", [folder])?;
+        if previous == Some(validity) {
+            return Ok(false);
         }
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM messages WHERE folder=?1", [folder])?;
+        tx.execute("DELETE FROM search WHERE folder=?1", [folder])?;
         tx.execute(
             "UPDATE folders SET validity=?2 WHERE name=?1",
             params![folder, validity],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn messages(&self, folder: &str) -> Result<Vec<Message>> {
@@ -112,30 +118,90 @@ impl Cache {
         payload.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
     }
 
+    pub fn uids(&self, folder: &str) -> Result<std::collections::HashSet<u32>> {
+        let mut query = self
+            .db
+            .prepare("SELECT uid FROM messages WHERE folder=?1")?;
+        Ok(query
+            .query_map([folder], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn put(&mut self, message: &Message) -> Result<()> {
+        self.put_batch(std::slice::from_ref(message))
+    }
+
+    pub fn put_batch(&mut self, messages: &[Message]) -> Result<()> {
         let tx = self.db.transaction()?;
-        tx.execute("INSERT INTO messages(folder, uid, payload) VALUES (?1, ?2, ?3) ON CONFLICT(folder, uid) DO UPDATE SET payload=excluded.payload", params![message.folder, message.uid, serde_json::to_string(message)?])?;
-        tx.execute(
-            "DELETE FROM search WHERE folder=?1 AND uid=?2",
-            params![message.folder, message.uid],
-        )?;
-        tx.execute("INSERT INTO search(folder, uid, sender, recipients, subject, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![message.folder, message.uid, message.from, format!("{} {}", message.to, message.cc), message.subject, message.body.as_deref().unwrap_or_default()])?;
+        {
+            let mut put = tx.prepare_cached("INSERT INTO messages(folder, uid, payload) VALUES (?1, ?2, ?3) ON CONFLICT(folder, uid) DO UPDATE SET payload=excluded.payload")?;
+            let mut delete = tx.prepare_cached("DELETE FROM search WHERE folder=?1 AND uid=?2")?;
+            let mut index = tx.prepare_cached("INSERT INTO search(folder, uid, sender, recipients, subject, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+            for message in messages {
+                put.execute(params![
+                    message.folder,
+                    message.uid,
+                    serde_json::to_string(message)?
+                ])?;
+                delete.execute(params![message.folder, message.uid])?;
+                index.execute(params![
+                    message.folder,
+                    message.uid,
+                    message.from,
+                    format!("{} {}", message.to, message.cc),
+                    message.subject,
+                    message.body.as_deref().unwrap_or_default()
+                ])?;
+            }
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn update_flags(
+        &mut self,
+        folder: &str,
+        validity: u32,
+        flags: &[MessageFlags],
+    ) -> Result<Vec<MessageFlags>> {
+        let tx = self.db.transaction()?;
+        let mut changed = Vec::new();
+        {
+            // Update just the JSON flags; bodies and the full-text index are untouched.
+            let mut update = tx.prepare_cached("UPDATE messages SET payload=json_set(payload, '$.seen', json(?4), '$.starred', json(?5)) WHERE folder=?1 AND uid=?2 AND json_extract(payload, '$.uid_validity')=?3 AND (json_extract(payload, '$.seen') != ?6 OR json_extract(payload, '$.starred') != ?7)")?;
+            for flag in flags {
+                if update.execute(params![
+                    folder,
+                    flag.uid,
+                    validity,
+                    if flag.seen { "true" } else { "false" },
+                    if flag.starred { "true" } else { "false" },
+                    flag.seen,
+                    flag.starred
+                ])? > 0
+                {
+                    changed.push(*flag);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn reconcile(
         &mut self,
         folder: &str,
         remote: &std::collections::HashSet<u32>,
-    ) -> Result<()> {
+    ) -> Result<Vec<u32>> {
         let tx = self.db.transaction()?;
         let existing: Vec<u32> = tx
             .prepare("SELECT uid FROM messages WHERE folder=?1")?
             .query_map([folder], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        let mut removed = Vec::new();
         for uid in existing {
             if !remote.contains(&uid) {
+                removed.push(uid);
                 tx.execute(
                     "DELETE FROM messages WHERE folder=?1 AND uid=?2",
                     params![folder, uid],
@@ -147,7 +213,7 @@ impl Cache {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(removed)
     }
 
     pub fn search(&self, folder: &str, query: &str) -> Result<Vec<Message>> {
@@ -169,6 +235,58 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn flag_updates_preserve_content_and_search_without_index_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = Cache::open(&temp.path().join("mail.db")).unwrap();
+        let message = Message {
+            uid: 1,
+            folder: "INBOX".into(),
+            uid_validity: 7,
+            body: Some("searchable body".into()),
+            html_body: Some("<p>body</p>".into()),
+            html_loaded: true,
+            attachments: vec![crate::model::Attachment {
+                name: "file".into(),
+                data: vec![1, 2, 3],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cache.put_batch(&[message]).unwrap();
+        // Any attempt to rebuild the index makes this test fail.
+        cache.db.execute_batch("CREATE TRIGGER reject_index_delete BEFORE DELETE ON search_content BEGIN SELECT RAISE(ABORT, 'index changed'); END; CREATE TRIGGER reject_index_insert BEFORE INSERT ON search_content BEGIN SELECT RAISE(ABORT, 'index changed'); END;").unwrap();
+        let flags = [MessageFlags {
+            uid: 1,
+            seen: true,
+            starred: true,
+        }];
+        assert_eq!(cache.update_flags("INBOX", 7, &flags).unwrap(), flags);
+        let loaded = cache.message("INBOX", 1).unwrap().unwrap();
+        assert!(loaded.seen && loaded.starred && loaded.html_loaded);
+        assert_eq!(loaded.body.as_deref(), Some("searchable body"));
+        assert_eq!(loaded.html_body.as_deref(), Some("<p>body</p>"));
+        assert_eq!(loaded.attachments[0].data, vec![1, 2, 3]);
+        assert_eq!(cache.search("INBOX", "searchable").unwrap().len(), 1);
+        let writes = cache.total_changes();
+        assert!(cache.update_flags("INBOX", 7, &flags).unwrap().is_empty());
+        assert!(
+            cache
+                .update_flags(
+                    "INBOX",
+                    8,
+                    &[MessageFlags {
+                        uid: 1,
+                        seen: false,
+                        starred: false
+                    }]
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(cache.total_changes(), writes);
+    }
+
     #[test]
     fn cache_search_reconcile_and_uidvalidity() {
         let temp = tempfile::tempdir().unwrap();

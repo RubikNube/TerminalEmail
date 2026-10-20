@@ -15,6 +15,13 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageFlags {
+    pub uid: u32,
+    pub seen: bool,
+    pub starred: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Message {
     pub uid: u32,
