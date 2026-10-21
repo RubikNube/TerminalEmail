@@ -71,6 +71,8 @@ timeout_ms = 750
 
 Plain sequences such as `gg` are character sequences. For named or modified keys use tokens such as `Enter`, `Esc`, `Ctrl-r`, `Alt-j`, or `Ctrl-x Ctrl-r`. Ambiguous exact/prefix bindings wait for the configured timeout. `Esc` cancels a pending sequence. In text prompts, printable keys enter text, `Backspace` removes a character, `Enter` accepts, and `Esc` cancels. Confirmation prompts require `y` or `n`.
 
+In “Save attachment to”, press `Tab` to complete a path. A unique match fills the name; multiple matches fill their common prefix and appear below the input. Type more and press `Tab` again to narrow the list. Directories end in `/`. Relative paths use the application's working directory; absolute paths and `~/` are supported. Spaces are literal and need no quotes. Hidden entries appear when the name you type starts with `.`. Press `Enter` on a directory to save there using the attachment's original sanitized filename. Existing files still require overwrite confirmation. Remap completion with `prompt.complete` in `[keybindings.prompt]`.
+
 ## Time grouping
 
 Conversations appear under selectable time headings: Future, Today, Yesterday, This week, This month, Older, and Unknown date. Empty sections are hidden. Each conversation stays together under its newest message's date. Dates use your local timezone, with weeks starting Monday.

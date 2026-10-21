@@ -8,6 +8,7 @@ mod grouping;
 mod keys;
 mod mail;
 mod model;
+mod path_completion;
 mod theme;
 mod ui;
 

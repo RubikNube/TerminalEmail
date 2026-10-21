@@ -44,6 +44,7 @@ pub const COMMANDS: &[&str] = &[
     "prompt.accept",
     "prompt.cancel",
     "prompt.delete",
+    "prompt.complete",
 ];
 
 pub type Bindings = BTreeMap<String, BTreeMap<String, String>>;
@@ -104,6 +105,7 @@ pub fn defaults() -> Bindings {
             ("Enter".into(), "prompt.accept".into()),
             ("Esc".into(), "prompt.cancel".into()),
             ("Backspace".into(), "prompt.delete".into()),
+            ("Tab".into(), "prompt.complete".into()),
         ]
         .into(),
     );

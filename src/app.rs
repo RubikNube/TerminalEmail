@@ -6,6 +6,7 @@ use crate::{
     keys::KeyMap,
     mail::{self, Request, Update, Worker},
     model::{Attachment, Folder, Message, threads},
+    path_completion::{self, Completion},
     theme::{self, Picker, Theme},
 };
 use anyhow::Result;
@@ -28,6 +29,7 @@ pub enum Prompt {
     AttachmentPath {
         attachment: Attachment,
         input: String,
+        completion: Completion,
     },
     Overwrite {
         attachment: Attachment,
@@ -1029,6 +1031,7 @@ impl App {
             Some("prompt.accept") => key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             Some("prompt.cancel") => key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             Some("prompt.delete") => key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            Some("prompt.complete") => key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             Some("quit") => {
                 self.quit = true;
                 return;
@@ -1055,6 +1058,16 @@ impl App {
             }
             self.keys.reset();
             return;
+        }
+        if let Prompt::AttachmentPath {
+            input, completion, ..
+        } = &mut prompt
+        {
+            if key.code == KeyCode::Tab {
+                *completion = Completion::complete(input, path_completion::home_dir().as_deref());
+            } else if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
+                *completion = Completion::default();
+            }
         }
         match &mut prompt {
             Prompt::Search(input)
@@ -1084,13 +1097,29 @@ impl App {
                                 self.prompt = Some(Prompt::AttachmentPath {
                                     input: compose::safe_filename(&attachment.name),
                                     attachment,
+                                    completion: Completion::default(),
                                 });
                             } else {
                                 self.status("Invalid attachment number", true);
                             }
                         }
-                        Prompt::AttachmentPath { attachment, input } => {
-                            let path = std::path::PathBuf::from(input);
+                        Prompt::AttachmentPath {
+                            attachment,
+                            input,
+                            mut completion,
+                        } => {
+                            let path = match path_completion::save_path(&input, &attachment.name) {
+                                Ok(path) => path,
+                                Err(error) => {
+                                    completion.message = Some(error.to_string());
+                                    self.prompt = Some(Prompt::AttachmentPath {
+                                        attachment,
+                                        input,
+                                        completion,
+                                    });
+                                    return;
+                                }
+                            };
                             if path.exists() {
                                 self.prompt = Some(Prompt::Overwrite { attachment, path });
                             } else if let Err(error) =
@@ -1324,6 +1353,7 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
                     "prompt.accept" => Some(KeyCode::Enter),
                     "prompt.cancel" => Some(KeyCode::Esc),
                     "prompt.delete" => Some(KeyCode::Backspace),
+                    "prompt.complete" => Some(KeyCode::Tab),
                     "quit" => {
                         app.quit = true;
                         None
@@ -1378,6 +1408,104 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    fn attachment_prompt(input: String) -> Prompt {
+        Prompt::AttachmentPath {
+            attachment: Attachment {
+                name: "../report.txt".into(),
+                content_type: "text/plain".into(),
+                data: b"attachment contents".to_vec(),
+            },
+            input,
+            completion: Completion::default(),
+        }
+    }
+
+    #[test]
+    fn attachment_completion_follows_bindings_and_clears_on_edit() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["Documents", "Downloads"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let mut app = demo_app().unwrap();
+        let initial = format!("{}/D", root.path().display());
+        app.prompt = Some(attachment_prompt(initial.clone()));
+        app.prompt_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(
+            matches!(&app.prompt, Some(Prompt::AttachmentPath { input, completion, .. })
+            if input == &format!("{initial}o") && completion.suggestions.len() == 2)
+        );
+        app.prompt_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), None);
+        assert!(
+            matches!(&app.prompt, Some(Prompt::AttachmentPath { completion, .. })
+            if completion.suggestions.is_empty() && completion.message.is_none())
+        );
+        app.prompt_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(
+            matches!(&app.prompt, Some(Prompt::AttachmentPath { input, .. })
+            if input.ends_with("/Downloads/"))
+        );
+        app.prompt_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
+        assert!(
+            matches!(&app.prompt, Some(Prompt::AttachmentPath { completion, .. })
+            if completion.suggestions.is_empty())
+        );
+
+        let overrides = [(
+            "prompt".into(),
+            [
+                ("Tab".into(), "unbound".into()),
+                ("Ctrl-t".into(), "prompt.complete".into()),
+            ]
+            .into(),
+        )]
+        .into();
+        app.keys = KeyMap::new(&overrides, 750).unwrap();
+        app.prompt = Some(attachment_prompt(initial.clone()));
+        app.prompt_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(
+            matches!(&app.prompt, Some(Prompt::AttachmentPath { input, .. }) if input == &initial)
+        );
+        app.prompt_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            None,
+        );
+        assert!(
+            matches!(&app.prompt, Some(Prompt::AttachmentPath { completion, .. })
+            if completion.suggestions.len() == 2)
+        );
+        app.prompt = Some(Prompt::Search("literal".into()));
+        app.prompt_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            None,
+        );
+        assert!(matches!(&app.prompt, Some(Prompt::Search(input)) if input == "literal"));
+    }
+
+    #[test]
+    fn saving_to_directory_uses_attachment_name_and_confirms_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("report.txt");
+        let mut app = demo_app().unwrap();
+        app.prompt = Some(attachment_prompt(format!("{}/", root.path().display())));
+        app.prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(app.prompt.is_none());
+        assert!(!app.error);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"attachment contents");
+        std::fs::write(&destination, b"existing").unwrap();
+        app.prompt = Some(attachment_prompt(root.path().display().to_string()));
+        app.prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(
+            matches!(&app.prompt, Some(Prompt::Overwrite { path, .. }) if path == &destination)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+        app.prompt_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), None);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+        app.prompt = Some(attachment_prompt(root.path().display().to_string()));
+        app.prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None);
+        app.prompt_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"attachment contents");
+    }
 
     fn picker_key(app: &mut App, code: KeyCode) {
         app.theme_picker_key(KeyEvent::new(code, KeyModifiers::NONE));

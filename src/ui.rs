@@ -478,7 +478,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, theme: &Theme) {
             Some(input.as_str()),
         ),
         Prompt::AttachmentPath { input, .. } => (
-            " Save attachment to · Enter / Esc ",
+            " Save attachment to · Tab complete · Enter / Esc ",
             String::new(),
             Some(input.as_str()),
         ),
@@ -498,7 +498,13 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, theme: &Theme) {
             None,
         ),
     };
-    let height = if matches!(prompt, Prompt::Send { .. }) {
+    let completion = match prompt {
+        Prompt::AttachmentPath { completion, .. } => Some(completion),
+        _ => None,
+    };
+    let height = if let Some(completion) = completion {
+        5 + completion.suggestions.len().min(8) as u16
+    } else if matches!(prompt, Prompt::Send { .. }) {
         frame.area().height.saturating_sub(4)
     } else if input.is_some() {
         5
@@ -521,7 +527,53 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, theme: &Theme) {
             Paragraph::new(format!("> {display}")).style(theme.style("prompt_input")),
             inner,
         );
-        frame.set_cursor_position((inner.x + 2 + display.width() as u16, inner.y));
+        if inner.width > 0 && inner.height > 0 {
+            frame.set_cursor_position((
+                (inner.x + 2 + display.width() as u16).min(inner.right() - 1),
+                inner.y,
+            ));
+        }
+        if let Some(completion) = completion {
+            let rows = inner.height.saturating_sub(2) as usize;
+            let visible = if completion.suggestions.len() > rows {
+                rows.saturating_sub(1)
+            } else {
+                completion.suggestions.len()
+            };
+            let mut lines: Vec<Line> = completion
+                .suggestions
+                .iter()
+                .take(visible)
+                .map(|path| {
+                    let name = path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(path);
+                    Line::from(safe_text(&format!(
+                        "{name}{}",
+                        if path.ends_with('/') { "/" } else { "" }
+                    )))
+                })
+                .collect();
+            if completion.suggestions.len() > visible {
+                lines.push(Line::from(format!(
+                    "… {} more matches",
+                    completion.suggestions.len() - visible
+                )));
+            } else if let Some(message) = &completion.message {
+                lines.push(Line::from(safe_text(message)));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).style(theme.style("muted")),
+                Rect::new(
+                    inner.x,
+                    inner.y + inner.height.min(2),
+                    inner.width,
+                    rows as u16,
+                ),
+            );
+        }
     } else {
         frame.render_widget(
             Paragraph::new(safe_text(&text))
@@ -535,6 +587,72 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_suggestions_render_with_overflow_and_cursor_at_all_sizes() {
+        for (width, height) in [(120, 40), (40, 12), (20, 5), (3, 2)] {
+            let prompt = Prompt::AttachmentPath {
+                attachment: crate::model::Attachment {
+                    name: "report.txt".into(),
+                    content_type: "text/plain".into(),
+                    data: vec![],
+                },
+                input: "~/very/long/path/that/extends/beyond/the/input/width/".into(),
+                completion: crate::path_completion::Completion {
+                    suggestions: (0..20).map(|i| format!("~/folder{i:02}/")).collect(),
+                    message: None,
+                },
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_prompt(frame, &prompt, &Theme::default()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            if width >= 40 {
+                assert!(text.contains("Tab complete"));
+                assert!(text.contains("folder00/"));
+                assert!(text.contains("more matches"));
+                let (x, y) = terminal.get_cursor_position().unwrap().into();
+                assert!(x < width && y < height);
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_completion_diagnostic_is_visible() {
+        let prompt = Prompt::AttachmentPath {
+            attachment: crate::model::Attachment {
+                name: "report.txt".into(),
+                content_type: "text/plain".into(),
+                data: vec![],
+            },
+            input: "~/missing".into(),
+            completion: crate::path_completion::Completion {
+                suggestions: vec![],
+                message: Some("No matching paths".into()),
+            },
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_prompt(frame, &prompt, &Theme::default()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("No matching paths"));
+    }
 
     #[test]
     fn theme_colors_apply_to_screens_prompts_help_and_resize_notice() {
