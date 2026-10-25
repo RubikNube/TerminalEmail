@@ -40,6 +40,7 @@ pub const COMMANDS: &[&str] = &[
     "message.previous",
     "message.open_browser",
     "message.open_editor",
+    "message.show_routing",
     "attachment.save",
     "prompt.accept",
     "prompt.cancel",
@@ -81,6 +82,7 @@ pub fn defaults() -> Bindings {
             ("R", "reply_all"),
             ("f", "forward"),
             ("e", "message.open_editor"),
+            ("H", "message.show_routing"),
             ("m", "toggle_read"),
             ("s", "toggle_star"),
             ("a", "archive"),
@@ -346,6 +348,41 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_shortcut_is_available_and_remappable_in_both_views() {
+        let now = Instant::now();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut keys = KeyMap::new(&Bindings::new(), 750).unwrap();
+        for context in ["threads", "message"] {
+            assert_eq!(
+                keys.feed(context, key('H'), now).as_deref(),
+                Some("message.show_routing")
+            );
+        }
+        assert!(keys.feed("folders", key('H'), now).is_none());
+        let overrides = ["threads", "message"]
+            .into_iter()
+            .map(|context| {
+                (
+                    context.into(),
+                    [
+                        ("H".into(), "unbound".into()),
+                        ("v".into(), "message.show_routing".into()),
+                    ]
+                    .into(),
+                )
+            })
+            .collect();
+        let mut keys = KeyMap::new(&overrides, 750).unwrap();
+        for context in ["threads", "message"] {
+            assert!(keys.feed(context, key('H'), now).is_none());
+            assert_eq!(
+                keys.feed(context, key('v'), now).as_deref(),
+                Some("message.show_routing")
+            );
+        }
+    }
 
     #[test]
     fn editor_shortcut_defaults_and_context_remapping() {

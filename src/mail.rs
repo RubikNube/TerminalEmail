@@ -26,6 +26,7 @@ pub enum Request {
     Sync(String),
     Load(String),
     Body(Message),
+    Routing(Message),
     Search {
         folder: String,
         query: String,
@@ -64,6 +65,11 @@ pub enum Update {
         messages: Vec<Message>,
     },
     Body(Box<Message>),
+    Routing(Box<Message>),
+    RoutingError {
+        message: Box<Message>,
+        error: String,
+    },
     BodyError {
         message: Box<Message>,
         error: String,
@@ -521,6 +527,10 @@ impl<B: MailBackend> MailWorker<B> {
                 self.enqueue(request, &mut pending);
             }
             if let Some(request) = pending.pop_front() {
+                let routing = match &request {
+                    Request::Routing(m) => Some(m.clone()),
+                    _ => None,
+                };
                 let body = match &request {
                     Request::Body(m) => Some(m.clone()),
                     _ => None,
@@ -532,7 +542,9 @@ impl<B: MailBackend> MailWorker<B> {
                 let error = match result {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => Some(safe_text(&format!("{error:#}"))),
-                    Err(_) => Some(if body.is_some() {
+                    Err(_) => Some(if routing.is_some() {
+                        "Routing header download timed out.".into()
+                    } else if body.is_some() {
                         "Message download timed out.".into()
                     } else {
                         "Request timed out. Cached mail remains available. A mutation or send may have reached the server; check before retrying.".into()
@@ -547,11 +559,23 @@ impl<B: MailBackend> MailWorker<B> {
                     {
                         continue;
                     }
+                    if let (Some(active), Request::Routing(other)) = (&routing, &request)
+                        && active.folder == other.folder
+                        && active.uid_validity == other.uid_validity
+                        && active.uid == other.uid
+                    {
+                        continue;
+                    }
                     self.enqueue(request, &mut pending);
                 }
                 if let Some(error) = error {
                     self.backend.disconnect();
-                    if let Some(message) = body {
+                    if let Some(message) = routing {
+                        self.emit(Update::RoutingError {
+                            message: Box::new(message),
+                            error,
+                        });
+                    } else if let Some(message) = body {
                         self.emit(Update::BodyError {
                             message: Box::new(message),
                             error,
@@ -601,6 +625,11 @@ impl<B: MailBackend> MailWorker<B> {
                     self.emit(Update::Error(error.to_string()));
                 }
             }
+            Request::Routing(ref message)
+                if pending.iter().any(|request| {
+                    matches!(request, Request::Routing(other) if other.folder == message.folder
+                    && other.uid_validity == message.uid_validity && other.uid == message.uid)
+                }) => {}
             Request::Body(ref message)
                 if pending.iter().any(|request| {
                     matches!(request, Request::Body(other) if other.folder == message.folder
@@ -750,6 +779,28 @@ impl<B: MailBackend> MailWorker<B> {
                 folder,
                 query,
             }),
+            Request::Routing(message) => {
+                let mut cached = self
+                    .cache
+                    .message(&message.folder, message.uid)?
+                    .filter(|m| m.uid_validity == message.uid_validity)
+                    .context("Message no longer exists; refresh the mailbox")?;
+                if cached.routing_headers.is_none() {
+                    self.backend
+                        .select(&message.folder, Some(message.uid_validity))
+                        .await?;
+                    let fetched = self
+                        .backend
+                        .fetch(&message.folder, message.uid_validity, &[message.uid], false)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .context("Message no longer exists; refresh the mailbox")?;
+                    cached.routing_headers = Some(fetched.routing_headers.unwrap_or_default());
+                    self.cache.put(&cached)?;
+                }
+                self.emit(Update::Routing(Box::new(cached)));
+            }
             Request::Body(message) => {
                 if let Some(cached) =
                     self.cache

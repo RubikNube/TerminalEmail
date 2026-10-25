@@ -1065,3 +1065,41 @@ async fn benchmark_warm_mailbox_sync() {
         start.elapsed().as_secs_f64()
     );
 }
+
+#[tokio::test]
+async fn routing_fetch_only_requests_headers_and_preserves_cached_content() {
+    let (_temp, mut worker, mut updates) = setup();
+    let mut legacy = worker.backend.messages[0].clone();
+    legacy.seen = true;
+    legacy.starred = true;
+    legacy.attachments.push(crate::model::Attachment {
+        name: "example".into(),
+        data: vec![1, 2],
+        ..Default::default()
+    });
+    worker.cache.put(&legacy).unwrap();
+    let headers = vec![crate::model::RoutingHeader {
+        name: "Received".into(),
+        value: "from sender by inbox".into(),
+    }];
+    worker.backend.messages[0].routing_headers = Some(headers.clone());
+    let (events, mut observed) = mpsc::unbounded_channel();
+    worker.backend.events = Some(events);
+    worker
+        .handle(Request::Routing(legacy.clone()))
+        .await
+        .unwrap();
+    assert_eq!(observed.try_recv().unwrap(), "select:INBOX");
+    assert_eq!(observed.try_recv().unwrap(), "headers:INBOX");
+    assert!(observed.try_recv().is_err());
+    let cached = worker.cache.message("INBOX", 1).unwrap().unwrap();
+    assert_eq!(cached.routing_headers, Some(headers));
+    assert_eq!(cached.body, legacy.body);
+    assert_eq!(cached.attachments[0].data, vec![1, 2]);
+    assert!(cached.seen && cached.starred);
+    assert!(matches!(updates.try_recv().unwrap(), Update::Routing(_)));
+    worker.backend.messages.clear();
+    worker.handle(Request::Routing(legacy)).await.unwrap();
+    assert!(observed.try_recv().is_err());
+    assert!(matches!(updates.try_recv().unwrap(), Update::Routing(_)));
+}

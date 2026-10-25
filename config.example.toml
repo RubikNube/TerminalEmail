@@ -40,12 +40,14 @@ timeout_ms = 750
 
 [keybindings.message]
 "e" = "message.open_editor"
+"H" = "message.show_routing"
 "]" = "message.next"
 "[" = "message.previous"
 "S" = "attachment.save"
 
 [keybindings.threads]
 "e" = "message.open_editor"
+"H" = "message.show_routing"
 "t" = "threads.toggle_time_grouping"
 
 # Theme picker has isolated bindings: printable keys enter the query.

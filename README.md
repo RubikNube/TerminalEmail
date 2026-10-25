@@ -168,3 +168,9 @@ cargo build --release
 ```
 
 The code separates terminal rendering, input dispatch, app state, cache, draft construction, and the IMAP/SMTP adapter. A dedicated worker owns the SQLite connection and async network runtime, so network requests do not block terminal navigation. Tests exercise key sequences and conflicts, cache identity/search/reconciliation, MIME parsing, draft validation, attachment writes, app workflows, and rendering at several terminal sizes. Protocol tests connect to local mock servers, including IMAP with verified TLS and refusal of plaintext IMAP/SMTP authentication. Live-provider authentication requires an actual account and is not exercised by the tests.
+
+## Email routing
+
+Press `H` in the conversation list or message view to display routing information. The list uses the conversation’s latest email. The popup shows numbered `Received` hops from oldest to newest, then delivery and authentication headers as reported by the email. Use `j`/`k`, `Ctrl-d`/`Ctrl-u`, and `gg`/`G` to scroll; `H`, `h`, or `Esc` closes it. `Ctrl-r` retries a failed header download.
+
+Routing headers are cached during synchronization and remain available offline. Older cached messages fetch headers on demand without downloading the body or marking the email read. Remap `message.show_routing` under `[keybindings.threads]` and `[keybindings.message]`.

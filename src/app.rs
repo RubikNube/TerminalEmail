@@ -54,6 +54,13 @@ enum BodyState {
     Failed(String),
 }
 
+pub struct RoutingPopup {
+    pub message: Message,
+    pub scroll: u16,
+    pub page_height: usize,
+    pub notice: Option<String>,
+}
+
 pub struct App {
     pub config: Config,
     pub theme: Theme,
@@ -78,6 +85,8 @@ pub struct App {
     pub view: View,
     pub status: String,
     pub error: bool,
+    pub routing: Option<RoutingPopup>,
+    routing_pending: HashSet<MessageKey>,
     pub help: bool,
     pub help_scroll: u16,
     pub prompt: Option<Prompt>,
@@ -120,6 +129,8 @@ impl App {
             view: View::Folders,
             status: "Loading cached mail…".into(),
             error: false,
+            routing: None,
+            routing_pending: HashSet::new(),
             help: false,
             help_scroll: 0,
             prompt: None,
@@ -420,6 +431,34 @@ impl App {
     pub fn update(&mut self, update: Update, worker: Option<&Worker>) {
         self.validate_editor_request();
         match update {
+            Update::Routing(message) => {
+                let key = message_key(&message);
+                self.routing_pending.remove(&key);
+                if let Some(old) = self.messages.iter_mut().find(|m| message_key(m) == key) {
+                    old.routing_headers = message.routing_headers.clone();
+                }
+                if let Some(popup) = self
+                    .routing
+                    .as_mut()
+                    .filter(|p| message_key(&p.message) == key)
+                {
+                    popup.message.routing_headers = message.routing_headers;
+                    popup.notice = None;
+                }
+            }
+            Update::RoutingError { message, error } => {
+                let key = message_key(&message);
+                self.routing_pending.remove(&key);
+                if let Some(popup) = self
+                    .routing
+                    .as_mut()
+                    .filter(|p| message_key(&p.message) == key)
+                {
+                    popup.notice = Some(format!(
+                        "Cannot load routing: {error}. Press Ctrl-r to retry."
+                    ));
+                }
+            }
             Update::Folders(folders) => {
                 self.folders = folders;
                 self.folder_cursor = self.folder_cursor.min(self.folders.len().saturating_sub(1));
@@ -561,6 +600,7 @@ impl App {
             self.view != *view
                 || self.active_folder != key.0
                 || self.help
+                || self.routing.is_some()
                 || self.prompt.is_some()
                 || self.theme_picker.is_some()
                 || self.quit
@@ -570,6 +610,49 @@ impl App {
         }) {
             self.editor_pending = None;
             self.editor_ready = None;
+        }
+    }
+
+    fn open_routing(&mut self, worker: Option<&Worker>) {
+        let Some(message) = self.selected().cloned() else {
+            return;
+        };
+        self.routing = Some(RoutingPopup {
+            message,
+            scroll: 0,
+            page_height: self.page_height,
+            notice: None,
+        });
+        self.keys.reset();
+        self.load_routing(worker);
+    }
+
+    fn load_routing(&mut self, worker: Option<&Worker>) {
+        let Some(popup) = self.routing.as_mut() else {
+            return;
+        };
+        if popup.message.routing_headers.is_some() {
+            return;
+        }
+        if self.offline || self.demo {
+            popup.notice = Some("Routing headers are not cached. Reconnect and try again.".into());
+            return;
+        }
+        let key = message_key(&popup.message);
+        if self.routing_pending.contains(&key) {
+            popup.notice = Some("Loading routing headers…".into());
+            return;
+        }
+        if worker.is_some_and(|w| {
+            w.requests
+                .try_send(Request::Routing(popup.message.clone()))
+                .is_ok()
+        }) {
+            self.routing_pending.insert(key);
+            popup.notice = Some("Loading routing headers…".into());
+        } else {
+            popup.notice =
+                Some("Mail worker is unavailable or busy. Press Ctrl-r to retry.".into());
         }
     }
 
@@ -710,6 +793,25 @@ impl App {
     fn apply_command(&mut self, command: &str, worker: Option<&Worker>) -> Option<ComposeKind> {
         if self.theme_picker.is_some() {
             self.theme_picker_command(command);
+            return None;
+        }
+        if let Some(popup) = self.routing.as_mut() {
+            let step = (popup.page_height.max(2) / 2) as u16;
+            match command {
+                "message.show_routing" | "back" => {
+                    self.routing = None;
+                    self.keys.reset();
+                }
+                "cursor.down" => popup.scroll = popup.scroll.saturating_add(1),
+                "cursor.up" => popup.scroll = popup.scroll.saturating_sub(1),
+                "page.down" => popup.scroll = popup.scroll.saturating_add(step),
+                "page.up" => popup.scroll = popup.scroll.saturating_sub(step),
+                "cursor.first" => popup.scroll = 0,
+                "cursor.last" => popup.scroll = u16::MAX,
+                "refresh" => self.load_routing(worker),
+                "quit" => self.quit = true,
+                _ => {}
+            }
             return None;
         }
         let step = self.page_height.max(2) / 2;
@@ -901,6 +1003,9 @@ impl App {
                 }
             }
             "compose" => return Some(ComposeKind::New),
+            "message.show_routing" if matches!(self.view, View::Threads | View::Message) => {
+                self.open_routing(worker)
+            }
             "message.open_editor" if matches!(self.view, View::Threads | View::Message) => {
                 self.open_editor(worker)
             }
@@ -1229,6 +1334,11 @@ pub fn demo_app() -> Result<App> {
         body: Some("Your inbox, at the speed of a keystroke.\n\nUse j/k to move, Enter or l to open, h or Esc to go back, q to quit.\n\ngg and G jump to the first and last item. Ctrl-d/u scroll half a page.\n\nPress ? for every configured binding. Remap keys in config.toml.\n\nThis is an offline demo. No mail server is contacted.\n\nYou can save the attached example with S.\n\nHappy reading!".into()),
         html_body: Some("<html><body><h1>Welcome to TerminalEmail</h1><p>Your inbox, at the speed of a keystroke.</p><p>Press <b>b</b> in the message view to open HTML in your browser.</p></body></html>".into()),
         html_loaded: true,
+        routing_headers: Some(vec![
+            crate::model::RoutingHeader { name: "Received".into(), value: "from relay.example.org by inbox.example.com; Sun, 25 Oct 2026 10:00:02 +0000".into() },
+            crate::model::RoutingHeader { name: "Received".into(), value: "from sender.example.org by relay.example.org; Sun, 25 Oct 2026 10:00:00 +0000".into() },
+            crate::model::RoutingHeader { name: "Authentication-Results".into(), value: "inbox.example.com; spf=pass; dkim=pass; dmarc=pass".into() },
+        ]),
         attachments: vec![Attachment { name: "welcome.txt".into(), content_type: "text/plain".into(), data: b"Welcome to TerminalEmail!\n".to_vec() }], ..Default::default()
     };
     let reply = Message { uid: 2, message_id: "reply@terminal-email".into(), references: vec![first.message_id.clone()], subject: "Re: Welcome to your terminal inbox".into(), timestamp: timestamp + 1, body: Some("Conversations stay together.\n\nUse [ and ] in the message view to move between messages in this thread.\n\nPress / to search the locally cached sender, recipients, subject, and message text.".into()), attachments: vec![], html_body: None, ..first.clone() };
@@ -1419,6 +1529,99 @@ mod tests {
             input,
             completion: Completion::default(),
         }
+    }
+
+    #[test]
+    fn routing_popup_preserves_selection_and_reader_scroll_and_blocks_actions() {
+        let mut app = demo_app().unwrap();
+        app.command("open", None);
+        app.command("cursor.last", None);
+        let selected = message_key(app.selected().unwrap());
+        app.command("message.show_routing", None);
+        assert_eq!(
+            message_key(&app.routing.as_ref().unwrap().message),
+            selected
+        );
+        app.command("trash", None);
+        app.command("compose", None);
+        app.command("help", None);
+        assert!(app.prompt.is_none() && !app.help);
+        app.command("cursor.down", None);
+        assert_eq!(app.routing.as_ref().unwrap().scroll, 1);
+        assert_eq!(message_key(app.selected().unwrap()), selected);
+        app.command("message.show_routing", None);
+        assert!(app.routing.is_none());
+        app.command("open", None);
+        app.scroll = 4;
+        app.command("message.show_routing", None);
+        assert_eq!(
+            message_key(&app.routing.as_ref().unwrap().message),
+            message_key(app.selected().unwrap())
+        );
+        app.command("back", None);
+        assert_eq!(app.view, View::Message);
+        assert_eq!(app.scroll, 4);
+        app.command("back", None);
+        app.command("cursor.first", None);
+        assert!(app.selected().is_none());
+        app.command("message.show_routing", None);
+        assert!(app.routing.is_none());
+    }
+
+    #[test]
+    fn routing_fetch_retries_deduplicates_and_does_not_reopen_closed_popup() {
+        let mut app = demo_app().unwrap();
+        app.command("open", None);
+        app.command("cursor.last", None);
+        app.demo = false;
+        let index = app.groups[app.thread_cursor][app.groups[app.thread_cursor].len() - 1];
+        app.messages[index].routing_headers = None;
+        let message = app.selected().unwrap().clone();
+        let (requests, mut received) = mpsc::channel(8);
+        let (_, updates) = mpsc::unbounded_channel();
+        let worker = Worker { requests, updates };
+        app.command("message.show_routing", Some(&worker));
+        app.command("refresh", Some(&worker));
+        assert!(matches!(received.try_recv().unwrap(), Request::Routing(_)));
+        assert!(received.try_recv().is_err());
+        app.update(
+            Update::RoutingError {
+                message: Box::new(message.clone()),
+                error: "Failed".into(),
+            },
+            Some(&worker),
+        );
+        assert!(
+            app.routing
+                .as_ref()
+                .unwrap()
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("Failed")
+        );
+        app.command("refresh", Some(&worker));
+        assert!(matches!(received.try_recv().unwrap(), Request::Routing(_)));
+        app.command("back", Some(&worker));
+        let mut loaded = message;
+        loaded.routing_headers = Some(vec![]);
+        app.update(Update::Routing(Box::new(loaded)), Some(&worker));
+        assert!(app.routing.is_none());
+        app.offline = true;
+        app.command("message.show_routing", None);
+        assert!(app.routing.as_ref().unwrap().notice.is_none());
+        app.command("back", None);
+        app.messages[index].routing_headers = None;
+        app.command("message.show_routing", None);
+        assert!(
+            app.routing
+                .as_ref()
+                .unwrap()
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("not cached")
+        );
     }
 
     #[test]

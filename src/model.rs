@@ -44,6 +44,31 @@ pub struct Message {
     #[serde(default)]
     pub html_loaded: bool,
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub routing_headers: Option<Vec<RoutingHeader>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingHeader {
+    pub name: String,
+    pub value: String,
+}
+
+fn is_routing_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "received"
+            | "return-path"
+            | "delivered-to"
+            | "x-original-to"
+            | "envelope-to"
+            | "received-spf"
+            | "authentication-results"
+            | "dkim-signature"
+            | "arc-seal"
+            | "arc-message-signature"
+            | "arc-authentication-results"
+    )
 }
 
 /// Mail and folder names are untrusted terminal input. Preserve printable Unicode,
@@ -96,6 +121,20 @@ pub fn parse_message(raw: &[u8], uid: u32, folder: &str, validity: u32) -> Messa
         ..Default::default()
     };
     if let Some(mail) = mail_parser::MessageParser::default().parse(raw) {
+        result.routing_headers = Some(
+            mail.headers()
+                .iter()
+                .filter(|header| is_routing_header(header.name()))
+                .map(|header| RoutingHeader {
+                    name: safe_text(header.name()),
+                    value: safe_text(&String::from_utf8_lossy(
+                        &raw[header.offset_start as usize..header.offset_end as usize],
+                    ))
+                    .trim()
+                    .to_owned(),
+                })
+                .collect(),
+        );
         let addresses = |address: Option<&mail_parser::Address<'_>>| {
             address
                 .map(|a| {
@@ -224,6 +263,35 @@ pub fn threads(messages: &[Message]) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_headers_preserve_repeats_folds_and_ignore_body_headers() {
+        let raw = b"rEcEiVeD: from relay by inbox; today\r\n\twith TLS\r\nReceived: from sender by relay\r\nAuthentication-Results: inbox; spf=pass\r\nX-Noise: ignore\r\nDelivered-To: you@example.org\x1b\x07\r\n\r\nReceived: body only";
+        let message = parse_message(raw, 1, "INBOX", 7);
+        let headers = message.routing_headers.as_ref().unwrap();
+        assert_eq!(headers.len(), 4);
+        assert!(headers[0].name.eq_ignore_ascii_case("received"));
+        assert!(headers[0].value.contains("\n\twith TLS"));
+        assert!(headers[1].value.contains("from sender by relay"));
+        assert!(!headers[3].value.contains('\x1b'));
+        assert!(!headers[3].value.contains('\x07'));
+        let header_only = parse_message(
+            raw.split_at(raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4)
+                .0,
+            1,
+            "INBOX",
+            7,
+        );
+        assert_eq!(header_only.routing_headers, message.routing_headers);
+        let mut payload = serde_json::to_value(message).unwrap();
+        payload.as_object_mut().unwrap().remove("routing_headers");
+        let legacy: Message = serde_json::from_value(payload).unwrap();
+        assert!(legacy.routing_headers.is_none());
+        assert_eq!(
+            parse_message(b"Subject: Empty\r\n\r\nHello", 2, "INBOX", 7).routing_headers,
+            Some(vec![])
+        );
+    }
 
     #[test]
     fn displays_modified_utf7_folder_names() {

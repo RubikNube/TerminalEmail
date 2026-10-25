@@ -70,7 +70,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         content(frame, app, regions[1]);
     }
-    let mode = if app.theme_picker.is_some() {
+    let mode = if app.routing.is_some() {
+        "ROUTING"
+    } else if app.theme_picker.is_some() {
         "THEMES"
     } else if app.prompt.is_some() {
         "INPUT"
@@ -99,6 +101,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]),
         regions[2],
     );
+    if app.routing.is_some() {
+        draw_routing(frame, app);
+    }
     if app.help {
         help(frame, app);
     }
@@ -322,6 +327,80 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
+}
+
+fn draw_routing(frame: &mut Frame, app: &mut App) {
+    let area = popup(frame.area(), 100, frame.area().height.saturating_sub(4));
+    let block = panel(
+        &app.theme,
+        " Email routing · H/back closes · Ctrl-r retries ",
+        true,
+    );
+    let inner = block.inner(area);
+    let popup = app.routing.as_mut().unwrap();
+    let mut text = format!(
+        "{}\nFrom: {}\n\n",
+        popup.message.subject, popup.message.from
+    );
+    if let Some(notice) = &popup.notice {
+        text.push_str(notice);
+    } else if let Some(headers) = &popup.message.routing_headers {
+        if headers.is_empty() {
+            text.push_str("This email contains no routing headers.");
+        } else {
+            text.push_str("Server hops — oldest first\n\n");
+            let mut count = 0;
+            for header in headers
+                .iter()
+                .rev()
+                .filter(|h| h.name.eq_ignore_ascii_case("Received"))
+            {
+                count += 1;
+                text.push_str(&format!(
+                    "Hop {count}\n{}: {}\n\n",
+                    header.name, header.value
+                ));
+            }
+            if count == 0 {
+                text.push_str("No Received headers.\n\n");
+            }
+            text.push_str("Delivery and authentication headers (as reported)\n\n");
+            for header in headers
+                .iter()
+                .filter(|h| !h.name.eq_ignore_ascii_case("Received"))
+            {
+                text.push_str(&format!("{}: {}\n\n", header.name, header.value));
+            }
+        }
+    }
+    let lines: Vec<Line<'static>> = safe_text(&text)
+        .lines()
+        .flat_map(|line| {
+            if line.is_empty() {
+                vec![Line::default()]
+            } else {
+                textwrap::wrap(line, inner.width.max(1) as usize)
+                    .into_iter()
+                    .map(|s| Line::raw(s.into_owned()))
+                    .collect()
+            }
+        })
+        .collect();
+    popup.page_height = inner.height as usize;
+    popup.scroll = popup.scroll.min(
+        lines
+            .len()
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app.theme.style("text"))
+            .scroll((popup.scroll, 0)),
+        inner,
+    );
 }
 
 fn help(frame: &mut Frame, app: &App) {
@@ -587,6 +666,59 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_popup_wraps_orders_hops_and_clamps_after_resize() {
+        let mut app = crate::app::demo_app().unwrap();
+        app.command("open", None);
+        app.command("cursor.last", None);
+        app.command("message.show_routing", None);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("Server hops — oldest first"));
+        assert!(
+            rendered.find("from sender.example.org").unwrap()
+                < rendered.find("from relay.example.org").unwrap()
+        );
+        let popup = app.routing.as_mut().unwrap();
+        let headers = popup.message.routing_headers.as_mut().unwrap();
+        headers[0].value = "Long routing field ".repeat(200);
+        terminal.resize(Rect::new(0, 0, 40, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.command("cursor.last", None);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.routing.as_ref().unwrap().scroll > 0);
+        app.routing.as_mut().unwrap().message.routing_headers = Some(vec![]);
+        terminal.resize(Rect::new(0, 0, 120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.routing.as_ref().unwrap().scroll, 0);
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("no routing headers"));
+        app.routing.as_mut().unwrap().notice = Some("Cannot load routing: test failure".into());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("test failure"));
+    }
 
     #[test]
     fn attachment_suggestions_render_with_overflow_and_cursor_at_all_sizes() {
