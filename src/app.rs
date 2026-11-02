@@ -1485,14 +1485,13 @@ fn event_loop(mut app: App, mut worker: Option<Worker>) -> Result<()> {
                         terminal = ratatui::try_init()?;
                         terminal.clear()?;
                         edited?;
-                        let message = draft.build(&app.config).with_context(|| {
+                        let prepared = draft.prepare(&app.config).with_context(|| {
                             format!("Draft retained at {}", draft.path.display())
                         })?;
-                        let preview = std::fs::read_to_string(&draft.path)?;
                         Ok(Prompt::Send {
                             draft,
-                            message: Box::new(message),
-                            preview,
+                            message: Box::new(prepared.message),
+                            preview: prepared.preview,
                         })
                     });
                 match result {
@@ -1518,6 +1517,59 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn attachment_confirmation_sends_snapshot_or_retains_draft() {
+        for (demo, key) in [
+            (false, KeyCode::Char('y')),
+            (false, KeyCode::Char('n')),
+            (false, KeyCode::Esc),
+            (true, KeyCode::Char('y')),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let attachment = temp.path().join("file.bin");
+            std::fs::write(&attachment, [0, 255]).unwrap();
+            let draft = Draft {
+                path: temp.path().join("draft.eml"),
+                kind: ComposeKind::New,
+                original: None,
+            };
+            std::fs::write(
+                &draft.path,
+                format!(
+                    "To: a@example.org\nSubject: Hi\nAttach: {}\n\nBody",
+                    attachment.display()
+                ),
+            )
+            .unwrap();
+            let mut app = demo_app().unwrap();
+            app.demo = demo;
+            app.offline = false;
+            let prepared = draft.prepare(&app.config).unwrap();
+            let expected = prepared.message.formatted();
+            std::fs::remove_file(attachment).unwrap();
+            app.prompt = Some(Prompt::Send {
+                draft: draft.clone(),
+                message: Box::new(prepared.message),
+                preview: prepared.preview,
+            });
+            let (requests, mut receiver) = mpsc::channel(1);
+            let (_sender, updates) = mpsc::unbounded_channel();
+            let worker = Worker { requests, updates };
+            app.apply_prompt_key(KeyEvent::new(key, KeyModifiers::NONE), Some(&worker));
+            assert!(app.prompt.is_none());
+            assert!(draft.path.exists());
+            if !demo && key == KeyCode::Char('y') {
+                let Request::Send { message, .. } = receiver.try_recv().unwrap() else {
+                    panic!("Expected send request");
+                };
+                assert_eq!(message.formatted(), expected);
+            } else {
+                assert!(receiver.try_recv().is_err());
+                assert!(app.status.contains("retained"));
+            }
+        }
+    }
 
     fn attachment_prompt(input: String) -> Prompt {
         Prompt::AttachmentPath {

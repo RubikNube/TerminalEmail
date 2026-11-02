@@ -668,6 +668,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn send_confirmation_shows_prepared_attachment_summary_before_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("report.pdf");
+        std::fs::write(&path, b"report").unwrap();
+        let app = crate::app::demo_app().unwrap();
+        let prepared = crate::compose::prepare(
+            &format!(
+                "To: alice@example.org\nSubject: Report\nAttach: {}\n\nHere are the files.",
+                path.display()
+            ),
+            &app.config,
+            crate::compose::ComposeKind::New,
+            None,
+        )
+        .unwrap();
+        let prompt = Prompt::Send {
+            draft: crate::compose::Draft {
+                path: temp.path().join("draft.eml"),
+                kind: crate::compose::ComposeKind::New,
+                original: None,
+            },
+            message: Box::new(prepared.message),
+            preview: prepared.preview,
+        };
+        for (width, height) in [(120, 40), (60, 20), (20, 5), (3, 2)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_prompt(frame, &prompt, &Theme::default()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            if width >= 60 {
+                assert!(text.contains("report.pdf (6 bytes)"));
+                assert!(
+                    text.find("report.pdf").unwrap() < text.find("Here are the files.").unwrap()
+                );
+                assert!(text.contains("y send"));
+            }
+        }
+    }
+
+    #[test]
     fn routing_popup_wraps_orders_hops_and_clamps_after_resize() {
         let mut app = crate::app::demo_app().unwrap();
         app.command("open", None);

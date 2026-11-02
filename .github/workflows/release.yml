@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          number = r"(?:0|[1-9][0-9]*)"
+          identifier = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+          pattern = rf"v{number}\.{number}\.{number}(?:-{identifier}(?:\.{identifier})*)?"
+          if re.fullmatch(pattern, tag) is None:
+              raise SystemExit(f"Invalid release tag: {tag}; expected vMAJOR.MINOR.PATCH[-PRERELEASE]")
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag} does not match Cargo.toml version {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"prerelease={'true' if '-' in version else 'false'}\n")
+          PY
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libdbus-1-dev pkg-config
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Package release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          package="terminal-email-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${package}"
+          install -m 755 target/release/terminal-email "dist/${package}/terminal-email"
+          cp README.md LICENSE config.example.toml "dist/${package}/"
+          cp -R themes "dist/${package}/themes"
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+          cd dist
+          sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
+          sha256sum --check "${package}.tar.gz.sha256"
+          "./${package}/terminal-email" --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          cd dist
+          sha256sum --check ./*.sha256
+          args=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+          if [[ "$PRERELEASE" == true ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${args[@]}" ./*.tar.gz ./*.sha256

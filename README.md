@@ -2,6 +2,31 @@
 
 A Rust terminal email client with Vim navigation and configurable TOML keybindings.
 
+## Download a release
+
+Download the Linux x86_64 `.tar.gz` archive and its `.sha256` file from
+[GitHub Releases](https://github.com/RubikNube/TerminalEmail/releases). For example,
+with both files in the current directory:
+
+```sh
+sha256sum --check terminal-email-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf terminal-email-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd terminal-email-v0.1.0-x86_64-unknown-linux-gnu
+./terminal-email --help
+./terminal-email demo
+```
+
+Replace `v0.1.0` with the downloaded version. The archive includes the executable,
+README, license, example configuration, and theme templates. To install the executable
+for your user, run `install -Dm755 terminal-email ~/.local/bin/terminal-email` from
+the extracted directory and ensure `~/.local/bin` is on your `PATH`.
+
+Release binaries are built on Ubuntu 24.04 and dynamically link system libraries.
+Use Ubuntu 24.04 or a compatible Linux distribution with glibc 2.39 or newer,
+OpenSSL 3, and D-Bus libraries. On Ubuntu, install runtime libraries with
+`sudo apt-get install libssl3t64 libdbus-1-3`. Password storage requires a running
+Secret Service keyring. For older or incompatible systems, build from source below.
+
 ## Build and try it
 
 Install stable Rust with [rustup](https://rustup.rs). On Linux, building also requires a C compiler, `pkg-config`, OpenSSL development files, and D-Bus development files. On Arch Linux these are provided by `base-devel`, `pkgconf`, `openssl`, and `dbus`.
@@ -153,9 +178,45 @@ Press `e` in the conversation list or message view to open readable headers and 
 
 The client temporarily releases the terminal and opens a draft using `[editor].command`, then `$EDITOR`, then `vi`. Editor commands are split into arguments without a shell. Edit the `To`, `Cc`, `Bcc`, and `Subject` headers, preserve the blank line, and write the message body below it. Save and exit the editor, then review and confirm sending in the client. Bcc recipients are included in the SMTP envelope but omitted from transmitted headers.
 
-Drafts are private files under `~/.local/share/terminal-email/drafts` (respecting XDG data directories). Cancelled or failed drafts are retained, with their path in the status message. Successful sends are appended to Sent and the draft is removed. If SMTP accepts a message but saving to Sent fails, the client explicitly reports delivery and retains the draft; do not resend it without checking delivery. Replies and forwards quote/include text only; outgoing attachments and a draft browser are not yet supported.
+To attach files, add one `Attach:` header per file above the blank line in your editor:
+
+```text
+To: alice@example.org
+Subject: Report
+Attach: ~/Documents/report.pdf
+Attach: /home/roland/Pictures/team photo.jpg
+
+Here are the files.
+```
+
+An empty `Attach:` line is ignored. Remove a line to remove that attachment. Absolute paths, `~/`, and paths relative to the application's working directory are supported. Spaces are literal; do not add quotes. Shell variables, commands, and globs are not expanded. Each path must point to a readable regular file; an invalid attachment prevents sending and retains the draft with an error identifying the path.
+
+After you save and exit, confirmation shows attachment filenames and byte sizes before the body. File contents are read once before confirmation; changes to source files afterward do not change the prepared message. Attachments are sent with their basenames and generic binary MIME type; local `Attach:` headers and full paths are not transmitted. Replies and forwards include received message text; attach any desired files explicitly.
+
+Drafts are private files under `~/.local/share/terminal-email/drafts` (respecting XDG data directories). Cancelled or failed drafts are retained, with their path in the status message. Retained drafts reference the original attachment paths; they do not keep copies of the files. Successful sends are appended to Sent and the draft is removed. If SMTP accepts a message but saving to Sent fails, the client explicitly reports delivery and retains the draft; do not resend it without checking delivery. A draft browser is not yet supported.
 
 ## Development
+
+### Publishing a release
+
+Update the version in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and
+commit both files with the release changes. Tag that commit with the matching
+`vMAJOR.MINOR.PATCH` version and push the tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow validates the tag against `Cargo.toml`, checks formatting,
+runs Clippy and tests, and builds the Linux x86_64 archive with locked dependencies.
+After these checks pass, it publishes a GitHub Release with generated notes, the
+archive, and its SHA-256 checksum. Tags such as `v0.2.0-rc.1` require the matching
+Cargo version `0.2.0-rc.1` and publish as prereleases. The workflow uses the built-in
+`GITHUB_TOKEN`; no additional release secret is required. It does not bump versions
+or create tags. A release tag must point to a commit containing the release workflow.
+
+### Working on the code
 
 See the [developer guide](docs/development.md) for architecture diagrams,
 runtime and storage details, extension checklists, testing, and troubleshooting.

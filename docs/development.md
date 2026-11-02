@@ -264,8 +264,24 @@ The event loop restores the terminal, invokes `[editor].command`, `$EDITOR`, or
 split into executable arguments with `shell-words`; they are not shell scripts.
 `TerminalGuard` and Ratatui's panic hook restore terminal modes on failure.
 
-After editing, draft validation builds a Lettre message and the UI asks for send
-confirmation. Replies set threading headers; Bcc recipients are retained in the
+After editing, `Draft::prepare` reads the draft once and returns a `PreparedDraft`
+containing a Lettre message and review text. Repeatable, case-insensitive `Attach:`
+headers select local files; empty values are ignored. Paths support absolute,
+working-directory-relative, and `~/` forms through the shared home expansion
+helper, without shell parsing. Files must be readable regular files. Attachment
+errors identify the path and retain the draft.
+
+Attachments use Lettre's `multipart/mixed` support with the plain-text body first,
+then files in header order, sanitized basenames, attachment disposition, and
+`application/octet-stream`. Drafts without files retain plain-text construction.
+File bytes are captured before confirmation, and the review shows filenames and
+sizes from that same preparation before the body. Sending and saving the Sent
+copy use the prepared message without rereading source files. Local `Attach:`
+headers and full paths are not transmitted. Retained drafts reference source
+paths rather than storing attachment copies. Replies and forwards attach no
+received files automatically.
+
+The UI asks for send confirmation. Replies set threading headers; Bcc recipients are retained in the
 SMTP envelope and omitted from transmitted headers. Recipient and subject
 validation errors leave the draft on disk.
 
@@ -401,8 +417,8 @@ file. That command cannot verify whether a provider supports the chosen port.
 Passwords can be replaced with `cargo run -- set-password`.
 
 Current boundaries are one account, password/app-password authentication, and
-Linux Secret Service integration. OAuth2, offline mutation queues, outgoing
-attachments, a draft browser/resume workflow, and remote search are absent.
+Linux Secret Service integration. OAuth2, offline mutation queues,
+a draft browser/resume workflow, and remote search are absent.
 The external editor supports composing replies and new messages, and `e` opens
 a disposable copy of a received message's headers and text. The `editor` module
 shares the launcher and owns private temporary message copies. HTML is rendered as safe text,
