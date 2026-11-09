@@ -55,6 +55,13 @@ impl MessageCopy {
                 safe_text(value).replace(['\n', '\r'], " ")
             )?;
         }
+        if !message.message_id.is_empty() {
+            writeln!(
+                file,
+                "Message-ID: <{}>",
+                safe_text(&message.message_id).replace(['\n', '\r'], " ")
+            )?;
+        }
         writeln!(
             file,
             "\n{}",
@@ -90,6 +97,7 @@ mod tests {
             cc: "copy@example.org".into(),
             subject: "Hello\nInjected: header".into(),
             date: "2026-10-19".into(),
+            message_id: "hello@example.org".into(),
             body: Some("Hello, 世界\nSecond line".into()),
             html_body: Some("<b>HTML omitted</b>".into()),
             ..Default::default()
@@ -108,13 +116,27 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             text,
-            "From: Sender <sender@example.org>\nTo: reader@example.org\nCc: copy@example.org\nDate: 2026-10-19\nSubject: Hello Injected: header\n\nHello, 世界\nSecond line\n"
+            "From: Sender <sender@example.org>\nTo: reader@example.org\nCc: copy@example.org\nDate: 2026-10-19\nSubject: Hello Injected: header\nMessage-ID: <hello@example.org>\n\nHello, 世界\nSecond line\n"
         );
         std::fs::write(directory.join("message.eml~"), "backup").unwrap();
         drop(copy);
         assert!(!directory.exists());
         assert_eq!(message.body.as_deref(), Some("Hello, 世界\nSecond line"));
         assert!(MessageCopy::create(&Message::default()).is_err());
+    }
+
+    #[test]
+    fn copy_omits_missing_message_id() {
+        let copy = MessageCopy::create(&Message {
+            body: Some("Hello".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !std::fs::read_to_string(copy.path())
+                .unwrap()
+                .contains("Message-ID:")
+        );
     }
 
     #[test]
