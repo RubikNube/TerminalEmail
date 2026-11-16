@@ -38,8 +38,15 @@ Rust library API.
 | [`config`](../src/config.rs) | Typed TOML, validation, paths, credential identity. |
 | [`model`](../src/model.rs) | Mail types, MIME parsing, text safety, threading. |
 | [`compose`](../src/compose.rs) | Draft files, external editor, outgoing mail, saves. |
+| [`calendar`](../src/calendar.rs) | Local date ranges, date navigation, Monday-first month rows. |
 | [`cache`](../src/cache.rs) | SQLite schema, message persistence, local search. |
 | [`mail`](../src/mail.rs) | Worker, request/update types, IMAP and SMTP adapter. |
+
+Calendar filtering is session state in `App`. It runs during conversation rebuilding
+against cached message timestamps converted to local dates. Date and full-text
+membership must match the same message; the entire matching conversation is retained.
+No worker request, cache migration, or network query is needed for date selection.
+The modal calendar uses an isolated `calendar` key context and existing theme roles.
 
 ## Runtime architecture
 
@@ -236,8 +243,8 @@ and bindings. Configuration is loaded at startup. Theme files reload whenever th
 [example file](../config.example.toml) is the public configuration example.
 
 Bindings map key sequences to named commands in `global`, `folders`, `threads`,
-`message`, `prompt`, and `theme_picker` contexts. Context bindings override equivalent global
-sequences. The theme picker uses only its own bindings to reserve printable input for its query. `unbound` removes a binding's action. Equivalent spellings such as
+`message`, `prompt`, `calendar`, and `theme_picker` contexts. Context bindings override equivalent global
+sequences. The calendar and theme picker each use only their own bindings; the theme picker reserves printable input for its query. `unbound` removes a binding's action. Equivalent spellings such as
 `gg` and `g g` can override defaults, but defining both in the same user context
 is rejected.
 

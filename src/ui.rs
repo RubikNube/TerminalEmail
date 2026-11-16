@@ -1,5 +1,6 @@
 use crate::{
     app::{App, Prompt, View},
+    calendar::{local_date, month_weeks},
     grouping::Row,
     model::{folder_display_name, safe_text},
     theme::{self, Theme},
@@ -72,6 +73,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let mode = if app.routing.is_some() {
         "ROUTING"
+    } else if app.calendar.is_some() {
+        "CALENDAR"
     } else if app.theme_picker.is_some() {
         "THEMES"
     } else if app.prompt.is_some() {
@@ -95,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ]),
             Line::styled(
                 app.theme_warning.as_ref().map(|warning| format!(" Space t themes · {}", safe_text(warning).replace('\n', " "))).unwrap_or_else(||
-                    " j/k move  l open/fold  h back  t time groups  Space t themes  / search  c compose  ? help".into()),
+                    " j/k move  l open/fold  h back  t time groups  D dates  Space t themes  / search  c compose  ? help".into()),
                 app.theme.style(if app.theme_warning.is_some() { "error" } else { "muted" }),
             ),
         ]),
@@ -109,6 +112,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(prompt) = &app.prompt {
         draw_prompt(frame, prompt, &app.theme);
+    }
+    if app.calendar.is_some() {
+        draw_calendar(frame, app);
     }
     if app.theme_picker.is_some() {
         draw_theme_picker(frame, app);
@@ -179,6 +185,11 @@ fn message_list(frame: &mut Frame, app: &App, area: Rect) {
             app.groups.len()
         )
     };
+    let title = if let Some(range) = app.date_filter {
+        format!("{} · {range} ", title.trim_end())
+    } else {
+        title
+    };
     let title = format!(
         "{} · time grouping {} ",
         title.trim_end(),
@@ -186,7 +197,7 @@ fn message_list(frame: &mut Frame, app: &App, area: Rect) {
     );
     let block = panel(&app.theme, title, app.view == View::Threads);
     if app.groups.is_empty() {
-        frame.render_widget(Paragraph::new("\n  No messages to show.\n\n  Ctrl-r refreshes the mailbox.\n  Esc clears a search.\n  c starts a new message.").style(app.theme.style("muted")).block(block), area);
+        frame.render_widget(Paragraph::new("\n  No messages to show.\n\n  Ctrl-r refreshes the mailbox.\n  Esc clears search/date filters.\n  c starts a new message.").style(app.theme.style("muted")).block(block), area);
         return;
     }
     let items = app
@@ -438,6 +449,156 @@ fn help(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_calendar(frame: &mut Frame, app: &App) {
+    use chrono::{Datelike, Local, Months};
+    let calendar = app.calendar.as_ref().unwrap();
+    let screen = frame.area();
+    let width = screen.width.min(46);
+    let height = screen.height.min(36);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = panel(&app.theme, " Filter cached mail by date ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(5),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(" [ Prev     t Today     Next ]", app.theme.style("accent")),
+            Line::from(format!(
+                " {}{}",
+                calendar.range(),
+                if calendar.anchor.is_some() {
+                    " (range)"
+                } else {
+                    ""
+                }
+            )),
+        ])
+        .style(app.theme.style("text")),
+        sections[0],
+    );
+    let mut counts = std::collections::HashMap::new();
+    for message in &app.messages {
+        if let Some(date) = local_date(message.timestamp) {
+            *counts.entry(date).or_insert(0usize) += 1;
+        }
+    }
+    let today = Local::now().date_naive();
+    let first = calendar.cursor.with_day(1).unwrap();
+    let months: Vec<_> = if sections[1].height >= 27 {
+        [
+            first.checked_sub_months(Months::new(1)),
+            Some(first),
+            first.checked_add_months(Months::new(1)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    } else {
+        vec![first]
+    };
+    let mut lines = Vec::new();
+    for month in months {
+        lines.push(Line::styled(
+            format!("       {}", month.format("%Y/%m (%b)")),
+            app.theme.style("accent").bold(),
+        ));
+        lines.push(Line::styled(
+            " Mo  Tu  We  Th  Fr  Sa  Su   Week",
+            app.theme.style("time_heading"),
+        ));
+        let weeks = month_weeks(month);
+        let selected_week = weeks
+            .iter()
+            .position(|week| week.contains(&Some(calendar.cursor)))
+            .unwrap_or(0);
+        let available = sections[1].height.saturating_sub(2) as usize;
+        for week in weeks
+            .iter()
+            .skip(if available < weeks.len() {
+                selected_week.saturating_sub(available.saturating_sub(1))
+            } else {
+                0
+            })
+            .take(if sections[1].height >= 27 {
+                6
+            } else {
+                available
+            })
+        {
+            let mut spans = Vec::new();
+            for (weekday, date) in week.iter().enumerate() {
+                let Some(date) = date else {
+                    spans.push(Span::raw("    "));
+                    continue;
+                };
+                let style = if *date == calendar.cursor {
+                    app.theme.style("picker_selection").reversed().bold()
+                } else if calendar.anchor.is_some()
+                    && *date >= calendar.range().start
+                    && *date <= calendar.range().end
+                {
+                    app.theme.style("conversation_selection")
+                } else if *date == today {
+                    app.theme.style("accent").underlined()
+                } else if counts.contains_key(date) {
+                    app.theme.style("unread").bold()
+                } else if weekday >= 5 {
+                    app.theme.style("starred")
+                } else {
+                    app.theme.style("text")
+                };
+                spans.push(Span::styled(
+                    format!(
+                        "{}{:2} ",
+                        if counts.contains_key(date) { '+' } else { ' ' },
+                        date.day()
+                    ),
+                    style,
+                ));
+            }
+            let date = week.iter().flatten().next().unwrap();
+            spans.push(Span::styled(
+                format!(" W{:02}", date.iso_week().week()),
+                app.theme.style("muted"),
+            ));
+            lines.push(Line::from(spans));
+        }
+        // A fixed height keeps three vertically stacked months aligned.
+        if sections[1].height >= 27 {
+            for _ in weeks.len()..7 {
+                lines.push(Line::from(""));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), sections[1]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                " {} cached message(s) on {}",
+                counts.get(&calendar.cursor).unwrap_or(&0),
+                calendar.cursor
+            )),
+            Line::from(" h/j/k/l or arrows: day/week"),
+            Line::from(" [ / ]: month   t: today   v: range"),
+            Line::from(" Enter: apply   Backspace: clear"),
+            Line::from(" Esc: cancel   +: day has cached mail"),
+        ])
+        .style(app.theme.style("muted")),
+        sections[2],
+    );
+}
+
 fn draw_theme_picker(frame: &mut Frame, app: &App) {
     let picker = app.theme_picker.as_ref().unwrap();
     let area = popup(frame.area(), 86, 20);
@@ -666,6 +827,42 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_shows_three_months_marks_mail_and_adapts_to_resize() {
+        use chrono::{Local, NaiveDate, TimeZone};
+        let mut app = crate::app::demo_app().unwrap();
+        app.command("open", None);
+        app.command("date.select", None);
+        let date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        app.calendar.as_mut().unwrap().cursor = date;
+        app.messages[0].timestamp = Local
+            .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+            .unwrap()
+            .timestamp();
+        for (width, height) in [(120, 40), (46, 36), (60, 20), (40, 12), (20, 5)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            if height >= 12 {
+                assert!(text.contains("2026/11 (Nov)"));
+                assert!(text.contains("+16"));
+            }
+            if height >= 36 {
+                assert!(text.contains("2026/10 (Oct)"));
+                assert!(text.contains("2026/12 (Dec)"));
+                assert!(text.contains("W44"));
+                assert!(text.contains("Enter: apply"));
+            }
+        }
+    }
 
     #[test]
     fn send_confirmation_shows_prepared_attachment_summary_before_body() {

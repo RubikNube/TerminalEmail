@@ -7,6 +7,18 @@ use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const COMMANDS: &[&str] = &[
+    "date.select",
+    "calendar.left",
+    "calendar.right",
+    "calendar.up",
+    "calendar.down",
+    "calendar.previous_month",
+    "calendar.next_month",
+    "calendar.today",
+    "calendar.range",
+    "calendar.accept",
+    "calendar.cancel",
+    "calendar.clear",
     "theme.select",
     "theme_picker.next",
     "theme_picker.previous",
@@ -83,6 +95,7 @@ pub fn defaults() -> Bindings {
             ("f", "forward"),
             ("e", "message.open_editor"),
             ("H", "message.show_routing"),
+            ("D", "date.select"),
             ("m", "toggle_read"),
             ("s", "toggle_star"),
             ("a", "archive"),
@@ -100,6 +113,33 @@ pub fn defaults() -> Bindings {
     message.insert("[".into(), "message.previous".into());
     message.insert("S".into(), "attachment.save".into());
     message.insert("b".into(), "message.open_browser".into());
+    bindings.insert(
+        "calendar".into(),
+        [
+            ("h", "calendar.left"),
+            ("Left", "calendar.left"),
+            ("l", "calendar.right"),
+            ("Right", "calendar.right"),
+            ("k", "calendar.up"),
+            ("Up", "calendar.up"),
+            ("j", "calendar.down"),
+            ("Down", "calendar.down"),
+            ("[", "calendar.previous_month"),
+            ("PageUp", "calendar.previous_month"),
+            ("]", "calendar.next_month"),
+            ("PageDown", "calendar.next_month"),
+            ("t", "calendar.today"),
+            ("v", "calendar.range"),
+            ("Enter", "calendar.accept"),
+            ("Esc", "calendar.cancel"),
+            ("q", "calendar.cancel"),
+            ("D", "calendar.cancel"),
+            ("Backspace", "calendar.clear"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect(),
+    );
     bindings.insert(
         "prompt".into(),
         [
@@ -233,6 +273,7 @@ impl KeyMap {
                 "message",
                 "prompt",
                 "theme_picker",
+                "calendar",
             ]
             .contains(&context.as_str())
             {
@@ -273,7 +314,7 @@ impl KeyMap {
 
     fn effective(&self, context: &str) -> Vec<(Vec<KeyEvent>, String)> {
         let mut result: Vec<(Vec<KeyEvent>, String)> = Vec::new();
-        let scopes = if context == "theme_picker" {
+        let scopes = if matches!(context, "theme_picker" | "calendar") {
             vec![context]
         } else {
             vec!["global", context]
@@ -348,6 +389,41 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_bindings_are_isolated_and_remappable() {
+        let overrides = [(
+            "calendar".into(),
+            [("x".into(), "calendar.accept".into())].into(),
+        )]
+        .into();
+        let mut keys = KeyMap::new(&overrides, 750).unwrap();
+        let now = Instant::now();
+        for context in ["threads", "message"] {
+            assert_eq!(
+                keys.feed(
+                    context,
+                    KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+                    now
+                )
+                .as_deref(),
+                Some("date.select")
+            );
+        }
+        for (code, expected) in [
+            (KeyCode::Char('h'), Some("calendar.left")),
+            (KeyCode::Char('q'), Some("calendar.cancel")),
+            (KeyCode::Char('x'), Some("calendar.accept")),
+            (KeyCode::Char('d'), None),
+            (KeyCode::Char('c'), None),
+        ] {
+            assert_eq!(
+                keys.feed("calendar", KeyEvent::new(code, KeyModifiers::NONE), now)
+                    .as_deref(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn routing_shortcut_is_available_and_remappable_in_both_views() {

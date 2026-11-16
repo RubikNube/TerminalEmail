@@ -66,6 +66,7 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `h` / `Esc` | Back; stay open at folders |
 | `q` | Quit from any screen (type normally in prompts) |
 | `/` | Search cached mail in the active folder |
+| `D` | Open calendar date filter in conversations or a message |
 | `n` / `N` | Next / previous result or conversation |
 | `[` / `]` | Previous / next message within a conversation |
 | `c` | Compose |
@@ -79,7 +80,7 @@ The cache is an ordinary, unencrypted SQLite database under `$XDG_CACHE_HOME/ter
 | `Space t` | Search and preview themes |
 | `?` | Show configured bindings |
 
-Contexts are `global`, `folders`, `threads`, `message`, `prompt`, and `theme_picker`. Context mappings override equivalent global mappings; the theme picker uses only its own bindings so printable keys remain search text. Add or replace keys with command names displayed in `?` help:
+Contexts are `global`, `folders`, `threads`, `message`, `prompt`, `calendar`, and `theme_picker`. Context mappings override equivalent global mappings; the calendar and theme picker use only their own bindings so printable keys remain search text. Add or replace keys with command names displayed in `?` help:
 
 ```toml
 [keybindings]
@@ -97,6 +98,33 @@ timeout_ms = 750
 Plain sequences such as `gg` are character sequences. For named or modified keys use tokens such as `Enter`, `Esc`, `Ctrl-r`, `Alt-j`, or `Ctrl-x Ctrl-r`. Ambiguous exact/prefix bindings wait for the configured timeout. `Esc` cancels a pending sequence. In text prompts, printable keys enter text, `Backspace` removes a character, `Enter` accepts, and `Esc` cancels. Confirmation prompts require `y` or `n`.
 
 In “Save attachment to”, press `Tab` to complete a path. A unique match fills the name; multiple matches fill their common prefix and appear below the input. Type more and press `Tab` again to narrow the list. Directories end in `/`. Relative paths use the application's working directory; absolute paths and `~/` are supported. Spaces are literal and need no quotes. Hidden entries appear when the name you type starts with `.`. Press `Enter` on a directory to save there using the attachment's original sanitized filename. Existing files still require overwrite confirmation. Remap completion with `prompt.complete` in `[keybindings.prompt]`.
+
+## Calendar date filtering
+
+Press `D` in the conversation list or a message to open a calendar inspired by
+[calendar.vim](https://github.com/nvim-telekasten/calendar-vim). Tall terminals show
+the previous, selected, and next month stacked vertically; shorter terminals show
+the selected month. Weeks start Monday and include ISO week numbers. Today is
+underlined, the cursor is highlighted, and `+` marks days with cached mail in the
+active folder. The bottom of the picker shows the selected day's message count.
+
+- `h` / `l` or Left / Right move one day; `j` / `k` or Down / Up move one week.
+- `[` / `]` or PageUp / PageDown move one month; `t` returns to today.
+- `Enter` filters to the selected day. For an inclusive range, press `v` to mark
+  its start, move to the other end, then press `Enter`. Press `v` again to unmark.
+- `Esc`, `q`, or `D` cancel without changing the applied filter.
+- `Backspace` clears the date filter while keeping any text search.
+
+Filtering uses message dates in your local timezone and cached headers, so it also
+works offline. Mail with an unknown date is excluded while a date filter is active.
+The conversation list shows the applied dates. Date and text filters combine: a
+message must satisfy both, and its entire conversation remains available. Calendar
+markers and counts include all cached messages in the folder, regardless of text
+search. `Esc` in the conversation list clears both filters; changing folders also
+clears them. Synchronization keeps the active date filter applied to new mail.
+
+Remap `date.select` under `[keybindings.threads]` or `[keybindings.message]`.
+Calendar navigation uses `[keybindings.calendar]`; command names appear in `?` help.
 
 ## Time grouping
 

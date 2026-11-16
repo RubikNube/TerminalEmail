@@ -49,6 +49,7 @@ timeout_ms = 750
 "e" = "message.open_editor"
 "H" = "message.show_routing"
 "t" = "threads.toggle_time_grouping"
+"D" = "date.select"
 
 # Theme picker has isolated bindings: printable keys enter the query.
 # [keybindings.theme_picker]
@@ -57,3 +58,14 @@ timeout_ms = 750
 # "Enter" = "theme_picker.accept"
 # "Esc" = "theme_picker.cancel"
 # "Backspace" = "theme_picker.delete"
+
+# Calendar has isolated bindings; all actions can be remapped.
+# [keybindings.calendar]
+# "h" = "calendar.left"
+# "l" = "calendar.right"
+# "[" = "calendar.previous_month"
+# "]" = "calendar.next_month"
+# "v" = "calendar.range"
+# "Enter" = "calendar.accept"
+# "Esc" = "calendar.cancel"
+# "Backspace" = "calendar.clear"

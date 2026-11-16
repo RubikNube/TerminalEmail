@@ -1,5 +1,6 @@
 use crate::{
     browser::Browser,
+    calendar::{Calendar, DateRange},
     compose::{self, ComposeKind, Draft},
     config::Config,
     grouping::{Period, Row, local_period},
@@ -67,6 +68,8 @@ pub struct App {
     pub theme_id: String,
     pub theme_warning: Option<String>,
     pub theme_picker: Option<Picker>,
+    pub calendar: Option<Calendar>,
+    pub date_filter: Option<DateRange>,
     theme_config_path: Option<std::path::PathBuf>,
     pub keys: KeyMap,
     pub folders: Vec<Folder>,
@@ -110,6 +113,8 @@ impl App {
             theme_id: "default".into(),
             theme_warning: None,
             theme_picker: None,
+            calendar: None,
+            date_filter: None,
             theme_config_path: None,
             keys: KeyMap::new(&config.keybindings.contexts, config.keybindings.timeout_ms)?,
             time_grouping: config.display.time_grouping,
@@ -149,7 +154,9 @@ impl App {
     }
 
     pub fn context(&self) -> &'static str {
-        if self.theme_picker.is_some() {
+        if self.calendar.is_some() {
+            "calendar"
+        } else if self.theme_picker.is_some() {
             "theme_picker"
         } else if self.prompt.is_some() {
             "prompt"
@@ -333,10 +340,17 @@ impl App {
 
     fn rebuild(&mut self) {
         self.groups = threads(&self.messages);
-        if let Some(ids) = &self.search_ids {
-            self.groups
-                .retain(|group| group.iter().any(|&i| ids.contains(&self.messages[i].uid)));
-        }
+        self.groups.retain(|group| {
+            group.iter().any(|&i| {
+                let message = &self.messages[i];
+                self.search_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&message.uid))
+                    && self
+                        .date_filter
+                        .is_none_or(|range| range.contains(message.timestamp))
+            })
+        });
         self.thread_cursor = self.thread_cursor.min(self.groups.len().saturating_sub(1));
         self.message_cursor = self.message_cursor.min(
             self.groups
@@ -603,6 +617,7 @@ impl App {
                 || self.routing.is_some()
                 || self.prompt.is_some()
                 || self.theme_picker.is_some()
+                || self.calendar.is_some()
                 || self.quit
                 || self
                     .selected()
@@ -791,6 +806,10 @@ impl App {
     }
 
     fn apply_command(&mut self, command: &str, worker: Option<&Worker>) -> Option<ComposeKind> {
+        if self.calendar.is_some() {
+            self.calendar_command(command);
+            return None;
+        }
         if self.theme_picker.is_some() {
             self.theme_picker_command(command);
             return None;
@@ -829,6 +848,13 @@ impl App {
             return None;
         }
         match command {
+            "date.select" if self.prompt.is_none() && self.view != View::Folders => {
+                let cursor = self
+                    .date_filter
+                    .map_or_else(|| chrono::Local::now().date_naive(), |range| range.start);
+                self.calendar = Some(Calendar::new(cursor));
+                self.keys.reset();
+            }
             "theme.select" if self.prompt.is_none() => self.open_theme_picker(),
             "threads.toggle_time_grouping" if self.view == View::Threads => {
                 self.time_grouping = !self.time_grouping;
@@ -898,6 +924,7 @@ impl App {
                             self.rows.clear();
                             self.list_cursor = 0;
                             self.collapsed.clear();
+                            self.date_filter = None;
                             self.search.clear();
                             self.search_ids = None;
                             self.thread_cursor = 0;
@@ -932,7 +959,8 @@ impl App {
                     self.view = View::Threads;
                     self.reveal_thread();
                 }
-                View::Threads if !self.search.is_empty() => {
+                View::Threads if !self.search.is_empty() || self.date_filter.is_some() => {
+                    self.date_filter = None;
                     self.search.clear();
                     self.search_ids = None;
                     self.rebuild();
@@ -1084,6 +1112,53 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    fn calendar_command(&mut self, command: &str) {
+        let calendar = self.calendar.as_mut().unwrap();
+        match command {
+            "calendar.left" => calendar.move_days(-1),
+            "calendar.right" => calendar.move_days(1),
+            "calendar.up" => calendar.move_days(-7),
+            "calendar.down" => calendar.move_days(7),
+            "calendar.previous_month" => calendar.move_months(-1),
+            "calendar.next_month" => calendar.move_months(1),
+            "calendar.today" => calendar.cursor = chrono::Local::now().date_naive(),
+            "calendar.range" => {
+                calendar.anchor = if calendar.anchor.is_some() {
+                    None
+                } else {
+                    Some(calendar.cursor)
+                }
+            }
+            "calendar.cancel" => {
+                self.calendar = None;
+                self.keys.reset();
+            }
+            "calendar.accept" | "calendar.clear" => {
+                self.date_filter = if command == "calendar.accept" {
+                    Some(calendar.range())
+                } else {
+                    None
+                };
+                self.calendar = None;
+                self.keys.reset();
+                self.view = View::Threads;
+                self.collapsed.clear();
+                self.thread_cursor = 0;
+                self.message_cursor = 0;
+                self.list_cursor = 0;
+                self.rebuild();
+                self.status(
+                    self.date_filter.map_or_else(
+                        || "Date filter cleared".into(),
+                        |range| format!("Cached mail dated {range} · Esc clears filters"),
+                    ),
+                    false,
+                );
+            }
+            _ => {}
+        }
     }
 
     fn search(&mut self, query: String, worker: Option<&Worker>) {
@@ -1517,6 +1592,104 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn calendar_combines_date_and_text_on_the_same_message_and_keeps_threads() {
+        use chrono::{Local, NaiveDate, TimeZone};
+        let mut app = demo_app().unwrap();
+        app.command("open", None);
+        let date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let timestamp = Local
+            .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+            .unwrap()
+            .timestamp();
+        app.messages = vec![
+            Message {
+                uid: 1,
+                message_id: "root".into(),
+                timestamp,
+                ..Default::default()
+            },
+            Message {
+                uid: 2,
+                references: vec!["root".into()],
+                timestamp: timestamp + 172800,
+                ..Default::default()
+            },
+            Message {
+                uid: 3,
+                message_id: "other".into(),
+                timestamp,
+                ..Default::default()
+            },
+        ];
+        app.search = "query".into();
+        app.search_ids = Some([2].into());
+        app.command("date.select", None);
+        app.calendar.as_mut().unwrap().cursor = date;
+        app.command("calendar.accept", None);
+        assert!(app.groups.is_empty()); // Separate members cannot satisfy separate filters.
+        app.search_ids = Some([1].into());
+        app.rebuild();
+        assert_eq!(app.groups, vec![vec![0, 1]]);
+        app.command("date.select", None);
+        app.command("calendar.range", None);
+        app.command("calendar.left", None);
+        app.command("calendar.left", None);
+        app.command("calendar.accept", None);
+        assert_eq!(
+            app.date_filter.unwrap(),
+            DateRange::new(date.pred_opt().unwrap().pred_opt().unwrap(), date)
+        );
+        app.command("date.select", None);
+        app.command("calendar.next_month", None);
+        app.command("calendar.cancel", None);
+        assert_eq!(app.date_filter.unwrap().end, date);
+        assert_eq!(app.search, "query");
+        app.command("date.select", None);
+        app.command("calendar.clear", None);
+        assert!(app.date_filter.is_none());
+        assert_eq!(app.search, "query");
+        assert_eq!(app.groups, vec![vec![0, 1]]);
+        app.command("date.select", None);
+        app.command("calendar.accept", None);
+        app.command("back", None);
+        assert!(app.date_filter.is_none());
+        assert!(app.search.is_empty());
+        assert_eq!(app.groups.len(), 2);
+    }
+
+    #[test]
+    fn calendar_filter_survives_cache_updates_and_resets_on_folder_change() {
+        let mut app = demo_app().unwrap();
+        app.command("open", None);
+        let date = crate::calendar::local_date(app.messages[0].timestamp).unwrap();
+        app.command("date.select", None);
+        app.calendar.as_mut().unwrap().cursor = date;
+        app.command("calendar.accept", None);
+        app.update(
+            Update::Messages {
+                folder: app.active_folder.clone(),
+                messages: app.messages.clone(),
+            },
+            None,
+        );
+        assert!(app.groups.iter().all(|group| {
+            group
+                .iter()
+                .any(|&i| app.date_filter.unwrap().contains(app.messages[i].timestamp))
+        }));
+        app.command("back", None); // Clear filters.
+        app.command("back", None); // Folders.
+        app.date_filter = Some(DateRange::new(date, date));
+        app.folders.push(Folder {
+            name: "Another".into(),
+            ..Default::default()
+        });
+        app.folder_cursor = app.folders.len() - 1;
+        app.command("open", None);
+        assert!(app.date_filter.is_none());
+    }
 
     #[test]
     fn attachment_confirmation_sends_snapshot_or_retains_draft() {

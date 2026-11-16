@@ -1,6 +1,7 @@
 mod app;
 mod browser;
 mod cache;
+mod calendar;
 mod compose;
 mod config;
 mod editor;
